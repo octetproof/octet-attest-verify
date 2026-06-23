@@ -1,0 +1,13 @@
+/target
+Cargo.lock.bak
+*.tmp
+
+# Local working files (not tracked).
+/docs/
+/scripts/
+/CLAUDE.md
+
+# Never commit attestation credentials / decode keys / service-account JSON.
+*.p8
+*-service-account*.json
+/secrets/

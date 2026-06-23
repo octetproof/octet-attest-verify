@@ -1,0 +1,28 @@
+# octet-attest-verify — verification config
+#
+# Copy to `octet-attest-verify.toml` and fill in your app's details. This is the
+# single place to configure verification; nothing is hardcoded in the tool.
+
+# iOS Apple App Attest. Omit this section if you only verify Android.
+[app_attest]
+# Your Apple Developer Team ID (App Store Connect → Membership).
+team_id = "ABCDE12345"
+# Your app's bundle identifier.
+bundle_id = "com.example.app"
+# Which App Attest environment to accept:
+#   "development" — only dev attestations (Xcode debug builds)
+#   "production"  — only prod attestations (TestFlight / App Store)
+#   "any"         — accept either (default; convenient while integrating)
+environment = "production"
+
+# Android Google Play Integrity. Omit this section if you only verify iOS.
+# Decoding a Play Integrity token is NOT offline — it needs your own Google
+# Cloud project (linked to the app in Play Console).
+[play_integrity]
+# The Cloud project NUMBER (numeric) the app's Play Integrity is linked to.
+cloud_project_number = 123456789012
+# The package name the token must be for.
+package_name = "com.example.app"
+# Path to the service-account JSON used to decode tokens.
+# IMPORTANT: keep this file local and OUT of source control — reference by path.
+service_account_json = "/secrets/play-integrity-sa.json"

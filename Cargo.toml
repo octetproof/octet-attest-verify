@@ -1,0 +1,51 @@
+[package]
+name = "octet-attest-verify"
+version = "1.0.0-alpha"
+edition = "2021"
+description = "Offline verification of mobile device-attestation evidence carried on an Octet LocationProof: Apple App Attest (attestation object + assertion, against Apple's static root) and a Google Play Integrity decode helper. No device-side secret or proof-creation logic."
+repository = "https://github.com/octetproof/octet-attest-verify"
+readme = "README.md"
+license = "Apache-2.0"
+# GitHub-only release; `publish = false` guards against an accidental
+# `cargo publish` to crates.io.
+publish = false
+
+[lib]
+name = "octet_attest_verify"
+path = "src/lib.rs"
+
+[features]
+# Default is the offline App Attest layer only — the part the public is asked
+# to trust: no network, no Google credentials, verifiable against a static
+# Apple root baked into the crate. `cargo build` of the default pulls none of
+# the Play Integrity / JSON / config / network deps.
+default = []
+# Play Integrity decode helper. Token decode is bound to a Google Play Console
+# project, so this path is for integrators wiring their own Cloud project (or
+# Octet's demo verifier wiring Octet's). Kept behind a feature so the audited
+# offline core stays lean.
+playintegrity = ["dep:serde", "dep:serde_json", "dep:base64"]
+# Load the unified verification config from a single TOML file. Off by default
+# so the library stays usable purely via parameters; the CLI / octet-verify
+# enable it.
+config = ["dep:serde", "dep:toml"]
+
+[dependencies]
+# --- offline App Attest core (default) ---
+ciborium = "0.2"        # CBOR: the App Attest attestation object + assertion
+x509-cert = { version = "0.2.5", features = ["pem"] }  # parse the cert chain + embedded root
+der = "0.7"             # DER access for the X.509 nonce extension
+spki = "0.7"            # SubjectPublicKeyInfo → leaf public key
+p256 = { version = "0.13", features = ["ecdsa"] }  # leaf device key + assertion verify
+p384 = { version = "0.13", features = ["ecdsa"] }  # Apple CA chain is P-384/SHA-384
+sha2 = "0.10"           # appId = SHA256(teamID ‖ bundleID); clientDataHash; fingerprint pin
+thiserror = "2"         # typed verification errors
+
+# --- shared config (feature = "config") + Play Integrity (feature = "playintegrity") ---
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+hex = "0.4"
