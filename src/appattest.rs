@@ -9,7 +9,7 @@
 //! unit-tested so the contract can't drift silently from the SDK side.
 
 use crate::error::{AttestError, Result};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
@@ -238,13 +238,22 @@ fn p384_key_from_cert(cert: &Certificate) -> Result<p384::ecdsa::VerifyingKey> {
         .map_err(|e| AttestError::MalformedCertChain(format!("issuer P-384 key: {e}")))
 }
 
-/// Verify `subject`'s signature was produced by `issuer_key` (ECDSA P-384 /
-/// SHA-384 — the algorithm Apple's App Attest CA chain uses).
+/// ECDSA-with-SHA256 / SHA384 signature-algorithm OIDs. Apple's App Attest CA
+/// chain mixes them: the intermediate (signed by the P-384 root) is
+/// `ecdsa-with-SHA384`, but the leaf credCert (signed by the P-384 intermediate)
+/// is `ecdsa-with-SHA256`. Both signatures are over a P-384 issuer key; only the
+/// message digest differs — so we must hash the TBS with the digest the subject
+/// cert actually declares, not a single hard-coded one.
+const ECDSA_WITH_SHA256_OID: &str = "1.2.840.10045.4.3.2";
+const ECDSA_WITH_SHA384_OID: &str = "1.2.840.10045.4.3.3";
+
+/// Verify `subject`'s signature was produced by `issuer_key` (ECDSA over a
+/// P-384 issuer key; digest per the subject's `signatureAlgorithm`).
 fn verify_cert_signature(
     subject: &Certificate,
     issuer_key: &p384::ecdsa::VerifyingKey,
 ) -> Result<()> {
-    use p384::ecdsa::signature::Verifier;
+    use p384::ecdsa::signature::hazmat::PrehashVerifier;
     let tbs = subject
         .tbs_certificate
         .to_der()
@@ -255,8 +264,22 @@ fn verify_cert_signature(
         .ok_or_else(|| AttestError::MalformedCertChain("signature not octet-aligned".into()))?;
     let sig = p384::ecdsa::Signature::from_der(sig_bytes)
         .map_err(|e| AttestError::MalformedCertChain(format!("ecdsa sig: {e}")))?;
+    // Hash the TBS with the digest the subject cert declares, then verify the
+    // P-384 ECDSA signature over that prehash (ECDSA takes the leftmost bits of
+    // a digest shorter than the field, so a SHA-256 prehash against a P-384 key
+    // is well-defined — this is exactly Apple's leaf credCert case).
+    let alg = subject.signature_algorithm.oid.to_string();
+    let prehash: Vec<u8> = match alg.as_str() {
+        ECDSA_WITH_SHA256_OID => Sha256::digest(&tbs).to_vec(),
+        ECDSA_WITH_SHA384_OID => Sha384::digest(&tbs).to_vec(),
+        other => {
+            return Err(AttestError::MalformedCertChain(format!(
+                "unsupported cert signature algorithm {other}"
+            )))
+        }
+    };
     issuer_key
-        .verify(&tbs, &sig)
+        .verify_prehash(&prehash, &sig)
         .map_err(|_| AttestError::ChainNotAnchored)
 }
 
@@ -417,17 +440,24 @@ pub fn verify_assertion(
         .and_then(|a| a.as_bytes())
         .ok_or_else(|| AttestError::MalformedAttestation("no authenticatorData".into()))?;
 
-    // Signature is over SHA256(authenticatorData ‖ clientDataHash); verify()
-    // applies the SHA-256 itself, so we pass the concatenation as the message.
+    // App Attest assertion (per Apple's validation steps): the device computes
+    //   nonce = SHA256(authenticatorData ‖ clientDataHash)
+    // and signs that 32-byte nonce with the attested P-256 key. ES256 applies
+    // its own SHA-256, so the signature is over SHA256(nonce). We must therefore
+    // verify against `nonce` — NOT the raw `authenticatorData ‖ clientDataHash`
+    // concatenation, which omits Apple's intermediate SHA-256 (that only ever
+    // self-verified against synthetic assertions built the same wrong way; a
+    // real device-produced assertion fails it).
     let client_data_hash = assertion_client_data_hash(nonce);
-    let mut message = auth_data.clone();
-    message.extend_from_slice(&client_data_hash);
+    let mut to_hash = auth_data.clone();
+    to_hash.extend_from_slice(&client_data_hash);
+    let assertion_nonce: [u8; 32] = Sha256::digest(&to_hash).into();
 
     let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_key_sec1)
         .map_err(|_| AttestError::AssertionSignatureInvalid)?;
     let sig = p256::ecdsa::Signature::from_der(signature)
         .map_err(|_| AttestError::AssertionSignatureInvalid)?;
-    vk.verify(&message, &sig)
+    vk.verify(&assertion_nonce, &sig)
         .map_err(|_| AttestError::AssertionSignatureInvalid)?;
 
     let ad = parse_auth_data(auth_data, false)?;
@@ -539,9 +569,11 @@ mod tests {
     }
 
     fn make_assertion(sk: &SigningKey, auth_data: &[u8], nonce: &[u8]) -> Vec<u8> {
-        let mut message = auth_data.to_vec();
-        message.extend_from_slice(&assertion_client_data_hash(nonce));
-        let sig: Signature = sk.sign(&message);
+        // Mirror a real device: sign nonce = SHA256(authenticatorData ‖ clientDataHash).
+        let mut to_hash = auth_data.to_vec();
+        to_hash.extend_from_slice(&assertion_client_data_hash(nonce));
+        let assertion_nonce: [u8; 32] = Sha256::digest(&to_hash).into();
+        let sig: Signature = sk.sign(&assertion_nonce);
         let value = ciborium::value::Value::Map(vec![
             (
                 ciborium::value::Value::Text("signature".into()),
