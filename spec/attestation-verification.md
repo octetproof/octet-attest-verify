@@ -181,6 +181,18 @@ hardware-attestation root:
    `KeyDescription`: the `attestationChallenge` must equal the expected
    key-generation challenge, and `attestationSecurityLevel` must be
    `TrustedEnvironment` (1) or `StrongBox` (2) — a `Software` (0) level fails.
+6. **App-identity binding (opt-in).** When an expected app identity is supplied,
+   the leaf's `attestationApplicationId` — parsed from the `softwareEnforced`
+   authorization list at context tag `[709]`, as
+   `AttestationApplicationId ::= SEQUENCE { packageInfos SET OF { packageName, version }, signatureDigests SET OF OCTET STRING }`
+   — must name the expected `packageName` **and** include the expected signing
+   certificate's SHA-256 among its `signatureDigests`. A mismatch, or an absent /
+   unparseable id when one was required, fails closed. This is what binds the
+   attested key to a specific app (the Android analog of App Attest's `appId`);
+   when no expected identity is supplied the hardware root is still checked but
+   the key is not bound to any app. The `attestationApplicationId` is extracted
+   best-effort so it can never weaken the strict challenge / security-level
+   checks above — its enforcement lives entirely in the opt-in comparison.
 
 **Not covered: revocation.** Google publishes a certificate status list
 (`android.googleapis.com/attestation/status`); a fully-offline verifier cannot

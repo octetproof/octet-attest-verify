@@ -108,6 +108,7 @@ pub fn verify_key_attestation(
     chain_der: &[Vec<u8>],
     expected_challenge: &[u8],
     now_unix_secs: u64,
+    expected_app: Option<&ExpectedAppIdentity>,
 ) -> Result<KeyAttestation> {
     if chain_der.is_empty() {
         return Err(AttestError::MalformedCertChain("empty certificate chain".into()));
@@ -139,6 +140,16 @@ pub fn verify_key_attestation(
     let kd = parse_key_description(leaf)?;
     if kd.challenge != expected_challenge {
         return Err(AttestError::AttestChallengeMismatch);
+    }
+    // App-identity binding (opt-in). When an expected identity is supplied, the
+    // attested `attestationApplicationId` must name that package and carry that
+    // signing-cert digest; a missing/unparseable id fails closed. Omitted ⇒ the
+    // hardware root is checked but the key is not bound to any app (prior behavior).
+    if let Some(expected) = expected_app {
+        match &kd.app_id {
+            Some(app_id) if app_id.matches(expected) => {}
+            _ => return Err(AttestError::AndroidAppIdentityMismatch),
+        }
     }
     let security_level = match kd.security_level {
         1 => SecurityLevel::TrustedEnvironment,
@@ -306,17 +317,59 @@ fn leaf_sec1_p256(leaf: &Certificate) -> Result<Vec<u8>> {
     Ok(sec1.to_vec())
 }
 
-/// The KeyDescription fields we enforce.
+/// The KeyDescription fields we enforce, plus the best-effort app identity.
 #[derive(Debug)]
 struct KeyDescription {
     version: i64,
     security_level: u8,
     challenge: Vec<u8>,
+    /// The `attestationApplicationId` from the `softwareEnforced` list, when it
+    /// could be located and parsed. `None` when absent or unparseable — a caller
+    /// that requires app binding treats `None` as a mismatch (fail closed).
+    app_id: Option<AttestationApplicationId>,
 }
 
-/// Parse the leaf's Key Attestation extension into the first five KeyDescription
-/// fields. Only those are security-relevant here; the rest of the SEQUENCE
-/// (authorization lists) is intentionally not walked.
+/// The Android `attestationApplicationId`: which app(s) and signing cert(s) the
+/// attested key was bound to at generation. Sets, because an app may declare
+/// more than one package or rotate signing certs.
+#[derive(Debug)]
+struct AttestationApplicationId {
+    package_names: Vec<Vec<u8>>,
+    signature_digests: Vec<Vec<u8>>,
+}
+
+/// The expected Android app identity to bind a key-attestation to. Supply it to
+/// [`verify_key_attestation`] to require that the attested `attestationApplicationId`
+/// names this package and includes this signing-cert digest; omit it to check the
+/// hardware root only (the pre-existing behavior).
+#[derive(Debug, Clone)]
+pub struct ExpectedAppIdentity {
+    /// The app package name, e.g. `com.example.app`.
+    pub package_name: String,
+    /// SHA-256 of the app signing certificate's DER (an Android `signatureDigests` entry).
+    pub signing_cert_sha256: [u8; 32],
+}
+
+impl AttestationApplicationId {
+    /// True iff this attestation names `expected.package_name` **and** carries
+    /// `expected.signing_cert_sha256` among its signature digests. Both must hold.
+    fn matches(&self, expected: &ExpectedAppIdentity) -> bool {
+        let pkg_ok = self
+            .package_names
+            .iter()
+            .any(|p| p.as_slice() == expected.package_name.as_bytes());
+        let sig_ok = self
+            .signature_digests
+            .iter()
+            .any(|d| d.as_slice() == expected.signing_cert_sha256);
+        pkg_ok && sig_ok
+    }
+}
+
+/// Parse the leaf's Key Attestation extension. The first five fields
+/// (through `attestationChallenge`) are the security-relevant ones and are
+/// parsed strictly; the `attestationApplicationId` inside `softwareEnforced` is
+/// then extracted **best-effort** (see [`extract_app_id`]).
 ///
 /// ```text
 /// KeyDescription ::= SEQUENCE {
@@ -325,7 +378,9 @@ struct KeyDescription {
 ///     keymasterVersion          INTEGER,
 ///     keymasterSecurityLevel    ENUMERATED,
 ///     attestationChallenge      OCTET STRING,
-///     ...                                      -- not parsed
+///     uniqueId                  OCTET STRING,
+///     softwareEnforced          AuthorizationList,  -- attestationApplicationId [709]
+///     teeEnforced               AuthorizationList,  -- not parsed
 /// }
 /// ```
 fn parse_key_description(leaf: &Certificate) -> Result<KeyDescription> {
@@ -372,11 +427,103 @@ fn parse_key_description_der(der: &[u8]) -> Result<KeyDescription> {
         return Err(bad("kmSecurityLevel not ENUMERATED"));
     }
     // attestationChallenge OCTET STRING.
-    let (t, v, _rest) = der_tlv(rest).ok_or_else(|| bad("truncated at challenge"))?;
+    let (t, v, rest) = der_tlv(rest).ok_or_else(|| bad("truncated at challenge"))?;
     if t != 0x04 {
         return Err(bad("challenge not OCTET STRING"));
     }
-    Ok(KeyDescription { version, security_level, challenge: v.to_vec() })
+    // attestationApplicationId lives deeper (softwareEnforced [709]); parse it
+    // best-effort so a variant/absent encoding can never break the strict
+    // challenge/security-level path above — a required-but-unparseable app id is
+    // handled as a mismatch by the caller, not as a parse error here.
+    let app_id = extract_app_id(rest);
+    Ok(KeyDescription { version, security_level, challenge: v.to_vec(), app_id })
+}
+
+/// Best-effort walk from just-after-`attestationChallenge` to the
+/// `attestationApplicationId`: skip `uniqueId`, enter `softwareEnforced`, find the
+/// context-tagged `[709]` field, and parse the `AttestationApplicationId` inside.
+/// Any deviation returns `None` (the field is optional and non-security-critical
+/// on its own; binding is enforced by the caller against `ExpectedAppIdentity`).
+///
+/// ```text
+/// AuthorizationList ::= SEQUENCE { ... attestationApplicationId [709] EXPLICIT OCTET STRING OPTIONAL ... }
+/// AttestationApplicationId ::= SEQUENCE {
+///     packageInfos      SET OF SEQUENCE { packageName OCTET STRING, version INTEGER },
+///     signatureDigests  SET OF OCTET STRING,
+/// }
+/// ```
+fn extract_app_id(after_challenge: &[u8]) -> Option<AttestationApplicationId> {
+    // uniqueId OCTET STRING.
+    let (t, _unique, rest) = der_tlv(after_challenge)?;
+    if t != 0x04 {
+        return None;
+    }
+    // softwareEnforced AuthorizationList (SEQUENCE).
+    let (t, sw_enforced, _rest) = der_tlv(rest)?;
+    if t != 0x30 {
+        return None;
+    }
+    // Find attestationApplicationId [709] EXPLICIT — context|constructed, high-tag
+    // form: identifier octets 0xBF 0x85 0x45. Its content is an OCTET STRING whose
+    // content is the DER-encoded AttestationApplicationId.
+    const ATT_APP_ID_TAG: &[u8] = &[0xBF, 0x85, 0x45];
+    let mut cursor = sw_enforced;
+    let app_id_octets = loop {
+        let (tag, value, next) = der_tlv_hightag(cursor)?;
+        if tag == ATT_APP_ID_TAG {
+            let (t, inner, _) = der_tlv(value)?; // the wrapped OCTET STRING
+            if t != 0x04 {
+                return None;
+            }
+            break inner;
+        }
+        cursor = next;
+    };
+    parse_attestation_application_id(app_id_octets)
+}
+
+/// Parse an `AttestationApplicationId` DER SEQUENCE into its package names and
+/// signature digests.
+fn parse_attestation_application_id(der: &[u8]) -> Option<AttestationApplicationId> {
+    let (tag, seq, _) = der_tlv(der)?; // SEQUENCE
+    if tag != 0x30 {
+        return None;
+    }
+    // packageInfos SET OF SEQUENCE { packageName OCTET STRING, version INTEGER }.
+    let (t, pkg_set, rest) = der_tlv(seq)?;
+    if t != 0x31 {
+        return None;
+    }
+    let mut package_names = Vec::new();
+    let mut p = pkg_set;
+    while !p.is_empty() {
+        let (t, info, next) = der_tlv(p)?; // AttestationPackageInfo SEQUENCE
+        if t != 0x30 {
+            return None;
+        }
+        let (t, name, _) = der_tlv(info)?; // packageName OCTET STRING
+        if t != 0x04 {
+            return None;
+        }
+        package_names.push(name.to_vec());
+        p = next;
+    }
+    // signatureDigests SET OF OCTET STRING.
+    let (t, sig_set, _) = der_tlv(rest)?;
+    if t != 0x31 {
+        return None;
+    }
+    let mut signature_digests = Vec::new();
+    let mut s = sig_set;
+    while !s.is_empty() {
+        let (t, dig, next) = der_tlv(s)?; // OCTET STRING
+        if t != 0x04 {
+            return None;
+        }
+        signature_digests.push(dig.to_vec());
+        s = next;
+    }
+    Some(AttestationApplicationId { package_names, signature_digests })
 }
 
 /// Fold a DER INTEGER's content bytes (big-endian, non-negative in practice for a
@@ -400,6 +547,35 @@ fn der_tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         return None;
     }
     Some((tag, &b[start..end], &b[end..]))
+}
+
+/// Like [`der_tlv`] but returns the full identifier octets, so a multi-byte
+/// high-tag-number tag (e.g. the context tag `[709]` = `0xBF 0x85 0x45`) can be
+/// matched. Returns `(tag_bytes, value, rest)`.
+fn der_tlv_hightag(b: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let first = *b.first()?;
+    // High-tag-number form: low 5 bits all set (0x1F); subsequent octets carry
+    // the number, each with MSB=1 except the last.
+    let tag_len = if first & 0x1f == 0x1f {
+        let mut n = 1;
+        loop {
+            let byte = *b.get(n)?;
+            n += 1;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        n
+    } else {
+        1
+    };
+    let (len, hdr) = der_len(b.get(tag_len..)?)?;
+    let start = tag_len + hdr;
+    let end = start.checked_add(len)?;
+    if end > b.len() {
+        return None;
+    }
+    Some((&b[..tag_len], &b[start..end], &b[end..]))
 }
 
 /// Decode a DER length, returning `(length, header_bytes_consumed)`.
@@ -443,13 +619,13 @@ mod tests {
 
     #[test]
     fn empty_chain_is_malformed() {
-        let err = verify_key_attestation(&[], b"x", 1_700_000_000).unwrap_err();
+        let err = verify_key_attestation(&[], b"x", 1_700_000_000, None).unwrap_err();
         assert!(matches!(err, AttestError::MalformedCertChain(_)));
     }
 
     #[test]
     fn garbage_cert_is_malformed() {
-        let err = verify_key_attestation(&[vec![0, 1, 2, 3]], b"x", 1_700_000_000).unwrap_err();
+        let err = verify_key_attestation(&[vec![0, 1, 2, 3]], b"x", 1_700_000_000, None).unwrap_err();
         assert!(matches!(err, AttestError::MalformedCertChain(_)));
     }
 
@@ -478,6 +654,100 @@ mod tests {
         let kd = parse_key_description_der(&der).unwrap();
         assert_eq!(kd.version, 4);
         assert_eq!(kd.security_level, 2);
+        assert_eq!(kd.challenge, b"abc");
+    }
+
+    // --- attestationApplicationId ([709]) parsing + matching ---
+
+    /// DER length (short + long form) for the builders below.
+    fn der_encode_len(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            return vec![len as u8];
+        }
+        let mut bytes = Vec::new();
+        let mut n = len;
+        while n > 0 {
+            bytes.insert(0, (n & 0xff) as u8);
+            n >>= 8;
+        }
+        let mut out = vec![0x80 | bytes.len() as u8];
+        out.extend(bytes);
+        out
+    }
+
+    /// TLV with an arbitrary (possibly multi-byte) tag and correct DER length.
+    fn der(tag: &[u8], val: &[u8]) -> Vec<u8> {
+        let mut out = tag.to_vec();
+        out.extend(der_encode_len(val.len()));
+        out.extend_from_slice(val);
+        out
+    }
+
+    /// A full KeyDescription carrying `attestationApplicationId [709]` with one
+    /// package + one signing-cert digest — exercises uniqueId + softwareEnforced.
+    fn key_description_der_with_app_id(challenge: &[u8], package: &[u8], sig_digest: &[u8]) -> Vec<u8> {
+        let pkg_info = der(&[0x30], &[der(&[0x04], package), der(&[0x02], &[1])].concat());
+        let package_infos = der(&[0x31], &pkg_info); // SET OF AttestationPackageInfo
+        let signature_digests = der(&[0x31], &der(&[0x04], sig_digest)); // SET OF OCTET STRING
+        let att_app_id = der(&[0x30], &[package_infos, signature_digests].concat());
+        // [709] EXPLICIT { OCTET STRING { att_app_id } }
+        let tagged = der(&[0xBF, 0x85, 0x45], &der(&[0x04], &att_app_id));
+        let software_enforced = der(&[0x30], &tagged);
+        let tee_enforced = der(&[0x30], &[]);
+        let body = [
+            der(&[0x02], &[4]),          // attestationVersion
+            der(&[0x0a], &[2]),          // attestationSecurityLevel = StrongBox
+            der(&[0x02], &[0x01, 0x2c]), // keymasterVersion = 300
+            der(&[0x0a], &[2]),          // keymasterSecurityLevel
+            der(&[0x04], challenge),     // attestationChallenge
+            der(&[0x04], &[]),           // uniqueId (empty)
+            software_enforced,
+            tee_enforced,
+        ]
+        .concat();
+        der(&[0x30], &body)
+    }
+
+    #[test]
+    fn parses_attestation_application_id() {
+        let digest = [0x11u8; 32];
+        let der_bytes = key_description_der_with_app_id(b"chal", b"com.octetproof.sample", &digest);
+        let kd = parse_key_description_der(&der_bytes).unwrap();
+        // Strict fields still parse alongside the deep app id.
+        assert_eq!(kd.challenge, b"chal");
+        assert_eq!(kd.security_level, 2);
+        let app = kd.app_id.expect("app id parsed");
+        assert_eq!(app.package_names, vec![b"com.octetproof.sample".to_vec()]);
+        assert_eq!(app.signature_digests, vec![digest.to_vec()]);
+    }
+
+    #[test]
+    fn app_identity_matches_requires_both_package_and_digest() {
+        let digest = [0x11u8; 32];
+        let der_bytes = key_description_der_with_app_id(b"chal", b"com.octetproof.sample", &digest);
+        let app = parse_key_description_der(&der_bytes).unwrap().app_id.unwrap();
+
+        assert!(app.matches(&ExpectedAppIdentity {
+            package_name: "com.octetproof.sample".into(),
+            signing_cert_sha256: digest,
+        }));
+        // Wrong package OR wrong digest → no match (both must hold).
+        assert!(!app.matches(&ExpectedAppIdentity {
+            package_name: "com.evil.app".into(),
+            signing_cert_sha256: digest,
+        }));
+        assert!(!app.matches(&ExpectedAppIdentity {
+            package_name: "com.octetproof.sample".into(),
+            signing_cert_sha256: [0x22; 32],
+        }));
+    }
+
+    #[test]
+    fn app_id_absent_is_none_and_does_not_break_strict_parse() {
+        // The minimal helper stops after the challenge (no authorization lists) →
+        // best-effort extraction yields None, strict fields still parse.
+        let kd = parse_key_description_der(&key_description_der(2, b"abc")).unwrap();
+        assert!(kd.app_id.is_none());
         assert_eq!(kd.challenge, b"abc");
     }
 

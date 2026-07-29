@@ -3,10 +3,11 @@ Cargo.lock.bak
 *.tmp
 .DS_Store
 
-# Local working files (not tracked).
-/docs/
-/scripts/
-/CLAUDE.md
+# Local agent / editor state.
+
+# Python caches (scripts/ is tracked in the private source-of-truth repo).
+__pycache__/
+*.pyc
 
 # Never commit attestation credentials / decode keys / service-account JSON.
 *.p8

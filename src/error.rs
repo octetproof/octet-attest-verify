@@ -26,6 +26,12 @@ pub enum AttestError {
     #[error("app identity mismatch")]
     AppIdMismatch,
 
+    /// The Android key-attestation `attestationApplicationId` (package name +
+    /// signing-cert digest) did not match the expected app identity — or an
+    /// expected identity was required but the attestation carried none.
+    #[error("android app identity mismatch")]
+    AndroidAppIdentityMismatch,
+
     /// The nonce committed in the attestation / assertion did not match the
     /// challenge reconstructed from the proof.
     #[error("challenge/nonce mismatch")]

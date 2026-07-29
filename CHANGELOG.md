@@ -4,6 +4,20 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [1.1.0] - 2026-07-29
+
+### Added
+- **Android app-identity binding (opt-in).** `verify_key_attestation` gains an
+  `Option<&ExpectedAppIdentity>` (`{ package_name, signing_cert_sha256 }`). When
+  supplied, the Keystore attestation's `attestationApplicationId` (parsed from the
+  `softwareEnforced` authorization list at context tag `[709]`) must name that
+  package and include that signing-cert SHA-256 among its `signatureDigests`; a
+  mismatch — or an absent/unparseable id when one was required — fails closed
+  (`AndroidAppIdentityMismatch`). This binds an attested key to a specific app
+  (the Android analog of App Attest's `appId`). When omitted, behavior is
+  unchanged (hardware root only). The `attestationApplicationId` is parsed
+  best-effort so it can never weaken the strict challenge / security-level checks.
+
 ## [1.0.0] - 2026-06-25
 
 First public release: an offline verifier for the mobile device-attestation
