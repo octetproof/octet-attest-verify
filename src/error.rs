@@ -82,6 +82,21 @@ pub enum AttestError {
     /// The attested key is software-backed (security level 0), not TEE/StrongBox.
     #[error("attested key is not hardware-backed (TEE/StrongBox)")]
     InsecureSecurityLevel,
+
+    /// Bootstrap only: the device's `verifiedBootState` is not `Verified` (or the
+    /// RootOfTrust was absent/unparseable, so verified boot could not be
+    /// established). A rooted / custom-ROM device must not mint a licence.
+    #[error("verified-boot state is not VERIFIED (bootstrap)")]
+    AttestationUnverifiedBoot,
+
+    /// Bootstrap only: the device bootloader is unlocked (`deviceLocked == false`).
+    #[error("device bootloader is unlocked (bootstrap)")]
+    AttestationBootloaderUnlocked,
+
+    /// Bootstrap only: a certificate in the attestation chain is on the caller-
+    /// supplied revocation list (Google `attestkey/v1/status`).
+    #[error("attestation key is revoked (bootstrap)")]
+    AttestationRevoked,
 }
 
 /// Result of any attestation verification step.

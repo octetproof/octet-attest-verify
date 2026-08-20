@@ -4,6 +4,58 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.1.0] - 2026-08-20
+
+Delivers the bootstrap key-attestation path to the **Python** consumer. The Rust
+API is unchanged from 2.0.0 — this is a binding and packaging release.
+
+### Added
+- **`verify_key_attestation` on the Python binding.** 2.0.0 shipped the Rust
+  function but the binding exposed only App Attest, so a Python consumer could
+  not reach the Android key-attestation path at all. Callers resolve the
+  attribute lazily, so a 2.0.0 wheel imports cleanly and then raises on first
+  use. Anything consuming the wheel needs 2.1.0 or later.
+- **The wheel ships as a release asset.** Built inside `python:3.12-slim` so
+  the compiled extension is not linked against a newer glibc than the image it
+  has to load on, and import-checked on that same image before it is attached.
+
+### Changed
+- pyo3 0.26.0 → 0.29.0, and `Cargo.lock` refreshed.
+
+### Note on scope
+Certificate-chain path validation is not changed in this release. Hardening it
+is tracked separately and needs a captured genuine chain first, so the change
+can be shown not to reject real devices; see `test-vectors/`.
+
+## [2.0.0] - 2026-08-14
+
+Adds the **bootstrap attestation posture** for the attested-bootstrap licence
+model. Android key-attestation gains a stricter mode for minting a licence,
+distinct from the softer proof path.
+
+### Changed (breaking)
+- **`verify_key_attestation` takes an `AttestMode` parameter.** `AttestMode::Proof`
+  is the previous behaviour; `AttestMode::Bootstrap { revoked_serials }` adds the
+  strict checks below — call sites must now pass a mode. `KeyAttestation` also
+  gains `app_identity` and `root_of_trust` fields.
+
+### Added
+- **Bootstrap verified-boot gate.** Parses `RootOfTrust` (from `teeEnforced` or
+  `softwareEnforced`, `[704]`) and, on `Bootstrap`, requires
+  `verifiedBootState == Verified` and `deviceLocked == true`; an absent RootOfTrust
+  fails closed. New errors `AttestationUnverifiedBoot` /
+  `AttestationBootloaderUnlocked`. The proof path is unchanged.
+- **Bootstrap revocation.** Rejects (`AttestationRevoked`) if any chain cert's
+  serial is in the caller-supplied `revoked_serials`. The crate stays fully
+  offline: the caller fetches Google's `attestkey/v1/status`, caches it, and owns
+  the fail-closed-on-fetch-failure policy; the crate only extracts serials and
+  checks membership (leading-zero-insensitive).
+- **`AttestedAppIdentity` accessor.** `KeyAttestation.app_identity` emits the parsed
+  `attestationApplicationId` as `{ package_names: Vec<String>, cert_sha256_digests:
+  Vec<[u8; 32]> }` for the caller to compare against a registered
+  `(package_name, signing_cert_sha256)` pair — multiple signers preserved.
+  Complements the existing opt-in `ExpectedAppIdentity` match.
+
 ## [1.1.0] - 2026-07-29
 
 ### Added

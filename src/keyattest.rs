@@ -13,10 +13,18 @@
 //! P-384 `Key Attestation CA1` root that became effective 2026-02-01) are baked
 //! in and pinned by fingerprint, exactly as the Apple root is.
 //!
-//! What it does **not** do: online revocation. Google publishes a certificate
-//! status list (`android.googleapis.com/attestation/status`); a fully-offline
-//! verifier cannot consult it, so a key revoked after issuance is not detected
-//! here. Callers that need revocation must layer it on with network access.
+//! The crate stays **fully offline** and does no network I/O. Revocation is still
+//! honoured on the bootstrap path, but the crate does not fetch Google's status
+//! list itself: the caller (which has network + a cache) fetches
+//! `android.googleapis.com/attestkey/v1/status` and passes the revoked serials in
+//! via [`AttestMode::Bootstrap`]; the crate extracts each chain cert's serial and
+//! rejects a match. This keeps the verifier deterministic and testable, and leaves
+//! the fetch / cache / fail-closed-on-fetch-failure policy with the caller.
+//!
+//! Two postures, selected by [`AttestMode`]: the **proof** path keeps a softer
+//! posture (no verified-boot or revocation enforcement); the **bootstrap** path
+//! (minting a licence) additionally requires verified boot + a locked bootloader
+//! and consults the revocation list.
 
 use crate::error::{AttestError, Result};
 use sha2::{Digest, Sha256, Sha384};
@@ -59,6 +67,83 @@ pub struct KeyAttestation {
     pub security_level: SecurityLevel,
     /// The attestation schema version from the KeyDescription.
     pub attestation_version: i64,
+    /// The attested app identity (package names + signing-cert SHA-256 digests)
+    /// for the caller to compare against a registered `(package, cert_sha256)`
+    /// pair — the **bootstrap identity-comparison contract**. `None` when the
+    /// `attestationApplicationId` is absent or unparseable. See
+    /// [`AttestedAppIdentity`].
+    pub app_identity: Option<AttestedAppIdentity>,
+    /// The device's verified-boot state + bootloader lock, when the RootOfTrust
+    /// was present and parseable. On the bootstrap path this is enforced (see
+    /// [`AttestMode`]); it is surfaced here for the proof path too, as
+    /// information.
+    pub root_of_trust: Option<RootOfTrust>,
+}
+
+/// Which verification posture to apply. The proof channel is softer; the
+/// bootstrap channel (minting a licence) is strict.
+pub enum AttestMode<'a> {
+    /// Proof channel: chain + challenge + hardware security level only. Verified
+    /// boot and revocation are **not** enforced (a proof from a rooted device is
+    /// flagged downstream, not rejected here). The pre-existing behaviour.
+    Proof,
+    /// Bootstrap channel (first licence claim): everything the proof path checks,
+    /// **plus** `verifiedBootState == Verified`, `deviceLocked == true`, and a
+    /// revocation check against `revoked_serials`.
+    Bootstrap {
+        /// Certificate serial numbers the caller has determined are revoked, from
+        /// Google's `attestkey/v1/status`. Raw big-endian INTEGER value bytes;
+        /// leading zeroes are ignored on both sides when comparing. The crate does
+        /// **not** fetch or cache — the caller owns the fetch, TTL cache, and the
+        /// fail-closed-on-fetch-failure policy. Empty ⇒ nothing revoked.
+        revoked_serials: &'a [Vec<u8>],
+    },
+}
+
+/// The device's Android RootOfTrust: verified-boot state and bootloader lock.
+/// Parsed from the KeyDescription authorization list (`rootOfTrust [704]`), in
+/// either `teeEnforced` (the usual home) or `softwareEnforced`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootOfTrust {
+    /// `true` iff the bootloader is locked (`deviceLocked`).
+    pub device_locked: bool,
+    /// The verified-boot state.
+    pub verified_boot_state: VerifiedBootState,
+}
+
+/// Android `verifiedBootState` — the boot chain's integrity level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedBootState {
+    /// `0` — full chain of trust to a device-manufacturer root (green). The only
+    /// state accepted on the bootstrap path.
+    Verified,
+    /// `1` — boot verified to a user-installed key (yellow).
+    SelfSigned,
+    /// `2` — verification disabled (orange).
+    Unverified,
+    /// `3` — dm-verity / boot verification failed (red).
+    Failed,
+}
+
+/// The attested Android app identity, in the shape the backend compares against a
+/// registered `(package_name, signing_cert_sha256)` pair: registered pair matches
+/// iff `package_name ∈ package_names` **and** `signing_cert_sha256 ∈
+/// cert_sha256_digests`.
+///
+/// Use this (returned on [`KeyAttestation`]) for the **bootstrap** identity
+/// comparison. The softer proof-side path can instead pass an
+/// [`ExpectedAppIdentity`] to [`verify_key_attestation`] and let the crate match.
+///
+/// Multiple entries are preserved verbatim (Android allows multiple declared
+/// packages and rotated signing certs — do not collapse). `package_names` are
+/// UTF-8 text; `cert_sha256_digests` are raw 32-byte digests — the caller
+/// hex-encodes if it needs to, the crate does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestedAppIdentity {
+    /// The declared app package name(s), e.g. `["com.example.app"]`.
+    pub package_names: Vec<String>,
+    /// SHA-256 digest(s) of the app signing certificate(s), raw bytes.
+    pub cert_sha256_digests: Vec<[u8; 32]>,
 }
 
 // --- Embedded Google hardware-attestation roots, pinned by fingerprint. ---
@@ -104,11 +189,22 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// certificate is within its validity window, the leaf's attestation challenge
 /// equals `expected_challenge`, and the attested security level is TEE or
 /// StrongBox (a Software level is rejected).
+///
+/// `mode` selects the posture ([`AttestMode`]). [`AttestMode::Proof`] is the
+/// pre-existing behaviour. [`AttestMode::Bootstrap`] additionally requires
+/// `verifiedBootState == Verified`, `deviceLocked == true`, and that no cert in
+/// the chain is in the supplied revoked-serials set — the stricter bar for
+/// minting a licence.
+///
+/// The returned [`KeyAttestation`] carries the parsed [`AttestedAppIdentity`] and
+/// [`RootOfTrust`] for the caller to inspect (e.g. the bootstrap identity
+/// comparison), independent of the opt-in `expected_app` match.
 pub fn verify_key_attestation(
     chain_der: &[Vec<u8>],
     expected_challenge: &[u8],
     now_unix_secs: u64,
     expected_app: Option<&ExpectedAppIdentity>,
+    mode: AttestMode,
 ) -> Result<KeyAttestation> {
     if chain_der.is_empty() {
         return Err(AttestError::MalformedCertChain("empty certificate chain".into()));
@@ -157,10 +253,60 @@ pub fn verify_key_attestation(
         _ => return Err(AttestError::InsecureSecurityLevel),
     };
 
-    // 5. The leaf's SEC1 P-256 device key — what proof signatures verify against.
+    // 5. Bootstrap posture (licence mint): verified boot + locked bootloader +
+    //    revocation. The proof path skips all of this by design.
+    if let AttestMode::Bootstrap { revoked_serials } = mode {
+        enforce_verified_boot(kd.root_of_trust)?;
+        let chain_serials: Vec<&[u8]> = certs
+            .iter()
+            .map(|c| c.tbs_certificate.serial_number.as_bytes())
+            .collect();
+        if is_revoked(&chain_serials, revoked_serials) {
+            return Err(AttestError::AttestationRevoked);
+        }
+    }
+
+    // 6. The leaf's SEC1 P-256 device key — what proof signatures verify against.
     let leaf_pubkey_sec1 = leaf_sec1_p256(leaf)?;
 
-    Ok(KeyAttestation { leaf_pubkey_sec1, security_level, attestation_version: kd.version })
+    Ok(KeyAttestation {
+        leaf_pubkey_sec1,
+        security_level,
+        attestation_version: kd.version,
+        app_identity: kd.app_id.as_ref().map(AttestationApplicationId::to_public),
+        root_of_trust: kd.root_of_trust,
+    })
+}
+
+/// Bootstrap: require a parsed RootOfTrust in the `Verified` state with a locked
+/// bootloader. Absent RootOfTrust ⇒ verified boot cannot be established ⇒ treated
+/// as unverified (fail closed).
+fn enforce_verified_boot(rot: Option<RootOfTrust>) -> Result<()> {
+    match rot {
+        None => Err(AttestError::AttestationUnverifiedBoot),
+        Some(r) if r.verified_boot_state != VerifiedBootState::Verified => {
+            Err(AttestError::AttestationUnverifiedBoot)
+        }
+        Some(r) if !r.device_locked => Err(AttestError::AttestationBootloaderUnlocked),
+        Some(_) => Ok(()),
+    }
+}
+
+/// True iff any serial in `chain_serials` is in `revoked_serials`. Compared on
+/// leading-zero-stripped bytes so a caller's hex-decoded serial need not match
+/// DER's positive-integer sign padding. Empty `revoked_serials` ⇒ never revoked.
+fn is_revoked(chain_serials: &[&[u8]], revoked_serials: &[Vec<u8>]) -> bool {
+    chain_serials.iter().any(|s| {
+        let s = strip_leading_zeros(s);
+        revoked_serials.iter().any(|r| strip_leading_zeros(r) == s)
+    })
+}
+
+/// Leading-zero-stripped view, for comparing certificate serials without caring
+/// about DER positive-integer sign padding vs. a caller's hex-decoded bytes.
+fn strip_leading_zeros(b: &[u8]) -> &[u8] {
+    let start = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+    &b[start..]
 }
 
 /// Confirm `now` is within `cert`'s `notBefore`..`notAfter`.
@@ -327,6 +473,10 @@ struct KeyDescription {
     /// could be located and parsed. `None` when absent or unparseable — a caller
     /// that requires app binding treats `None` as a mismatch (fail closed).
     app_id: Option<AttestationApplicationId>,
+    /// The `rootOfTrust [704]` from `teeEnforced` (or `softwareEnforced`), when
+    /// present and parseable. `None` when absent — the bootstrap path treats
+    /// `None` as unverified boot (fail closed).
+    root_of_trust: Option<RootOfTrust>,
 }
 
 /// The Android `attestationApplicationId`: which app(s) and signing cert(s) the
@@ -351,6 +501,26 @@ pub struct ExpectedAppIdentity {
 }
 
 impl AttestationApplicationId {
+    /// Convert the raw parsed form into the caller-facing [`AttestedAppIdentity`]:
+    /// package names as UTF-8 (lossy — Android names are UTF-8 by spec; a garbled
+    /// name simply won't match a registered one), and only well-formed 32-byte
+    /// SHA-256 digests (a non-32-byte entry can't be a signing-cert digest, so it
+    /// is dropped rather than surfaced).
+    fn to_public(&self) -> AttestedAppIdentity {
+        AttestedAppIdentity {
+            package_names: self
+                .package_names
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect(),
+            cert_sha256_digests: self
+                .signature_digests
+                .iter()
+                .filter_map(|d| <[u8; 32]>::try_from(d.as_slice()).ok())
+                .collect(),
+        }
+    }
+
     /// True iff this attestation names `expected.package_name` **and** carries
     /// `expected.signing_cert_sha256` among its signature digests. Both must hold.
     fn matches(&self, expected: &ExpectedAppIdentity) -> bool {
@@ -379,8 +549,8 @@ impl AttestationApplicationId {
 ///     keymasterSecurityLevel    ENUMERATED,
 ///     attestationChallenge      OCTET STRING,
 ///     uniqueId                  OCTET STRING,
-///     softwareEnforced          AuthorizationList,  -- attestationApplicationId [709]
-///     teeEnforced               AuthorizationList,  -- not parsed
+///     softwareEnforced          AuthorizationList,  -- attestationApplicationId [709], rootOfTrust [704]
+///     teeEnforced               AuthorizationList,  -- rootOfTrust [704] (usual home)
 /// }
 /// ```
 fn parse_key_description(leaf: &Certificate) -> Result<KeyDescription> {
@@ -436,7 +606,93 @@ fn parse_key_description_der(der: &[u8]) -> Result<KeyDescription> {
     // challenge/security-level path above — a required-but-unparseable app id is
     // handled as a mismatch by the caller, not as a parse error here.
     let app_id = extract_app_id(rest);
-    Ok(KeyDescription { version, security_level, challenge: v.to_vec(), app_id })
+    let root_of_trust = extract_root_of_trust(rest);
+    Ok(KeyDescription { version, security_level, challenge: v.to_vec(), app_id, root_of_trust })
+}
+
+/// Best-effort walk from just-after-`attestationChallenge` to the `rootOfTrust`
+/// (`[704]`): search `softwareEnforced`, then `teeEnforced` (the spec allows
+/// either; teeEnforced is the usual home). `None` on any deviation — the
+/// bootstrap caller treats `None` as unverified boot (fail closed).
+///
+/// ```text
+/// AuthorizationList ::= SEQUENCE { ... rootOfTrust [704] EXPLICIT RootOfTrust OPTIONAL ... }
+/// RootOfTrust ::= SEQUENCE {
+///     verifiedBootKey    OCTET STRING,
+///     deviceLocked       BOOLEAN,
+///     verifiedBootState  ENUMERATED,  -- 0 Verified / 1 SelfSigned / 2 Unverified / 3 Failed
+///     verifiedBootHash   OCTET STRING OPTIONAL,
+/// }
+/// ```
+fn extract_root_of_trust(after_challenge: &[u8]) -> Option<RootOfTrust> {
+    // uniqueId OCTET STRING.
+    let (t, _unique, rest) = der_tlv(after_challenge)?;
+    if t != 0x04 {
+        return None;
+    }
+    // softwareEnforced AuthorizationList (SEQUENCE) — check it first.
+    let (t, sw_enforced, rest) = der_tlv(rest)?;
+    if t != 0x30 {
+        return None;
+    }
+    if let Some(rot) = find_root_of_trust(sw_enforced) {
+        return Some(rot);
+    }
+    // teeEnforced AuthorizationList (SEQUENCE) — the usual home for RootOfTrust.
+    let (t, tee_enforced, _rest) = der_tlv(rest)?;
+    if t != 0x30 {
+        return None;
+    }
+    find_root_of_trust(tee_enforced)
+}
+
+/// Scan an AuthorizationList for `rootOfTrust [704]` (identifier octets
+/// `0xBF 0x85 0x40`; EXPLICIT, so its content is the RootOfTrust SEQUENCE
+/// directly) and parse it.
+fn find_root_of_trust(authlist: &[u8]) -> Option<RootOfTrust> {
+    const ROOT_OF_TRUST_TAG: &[u8] = &[0xBF, 0x85, 0x40];
+    let mut cursor = authlist;
+    while !cursor.is_empty() {
+        let (tag, value, next) = der_tlv_hightag(cursor)?;
+        if tag == ROOT_OF_TRUST_TAG {
+            return parse_root_of_trust(value);
+        }
+        cursor = next;
+    }
+    None
+}
+
+/// Parse a `RootOfTrust` SEQUENCE: `verifiedBootKey` (skipped), `deviceLocked`,
+/// `verifiedBootState`. A trailing `verifiedBootHash`, if present, is ignored.
+fn parse_root_of_trust(der: &[u8]) -> Option<RootOfTrust> {
+    let (tag, seq, _) = der_tlv(der)?;
+    if tag != 0x30 {
+        return None;
+    }
+    // verifiedBootKey OCTET STRING (skipped).
+    let (t, _vbk, rest) = der_tlv(seq)?;
+    if t != 0x04 {
+        return None;
+    }
+    // deviceLocked BOOLEAN — any non-zero content octet is TRUE.
+    let (t, locked, rest) = der_tlv(rest)?;
+    if t != 0x01 {
+        return None;
+    }
+    let device_locked = locked.iter().any(|&b| b != 0x00);
+    // verifiedBootState ENUMERATED.
+    let (t, state, _) = der_tlv(rest)?;
+    if t != 0x0a {
+        return None;
+    }
+    let verified_boot_state = match state.last().copied()? {
+        0 => VerifiedBootState::Verified,
+        1 => VerifiedBootState::SelfSigned,
+        2 => VerifiedBootState::Unverified,
+        3 => VerifiedBootState::Failed,
+        _ => return None,
+    };
+    Some(RootOfTrust { device_locked, verified_boot_state })
 }
 
 /// Best-effort walk from just-after-`attestationChallenge` to the
@@ -619,13 +875,14 @@ mod tests {
 
     #[test]
     fn empty_chain_is_malformed() {
-        let err = verify_key_attestation(&[], b"x", 1_700_000_000, None).unwrap_err();
+        let err = verify_key_attestation(&[], b"x", 1_700_000_000, None, AttestMode::Proof).unwrap_err();
         assert!(matches!(err, AttestError::MalformedCertChain(_)));
     }
 
     #[test]
     fn garbage_cert_is_malformed() {
-        let err = verify_key_attestation(&[vec![0, 1, 2, 3]], b"x", 1_700_000_000, None).unwrap_err();
+        let err = verify_key_attestation(&[vec![0, 1, 2, 3]], b"x", 1_700_000_000, None, AttestMode::Proof)
+            .unwrap_err();
         assert!(matches!(err, AttestError::MalformedCertChain(_)));
     }
 
@@ -763,5 +1020,120 @@ mod tests {
         assert!(der_len(&[0x85, 1, 2, 3, 4, 5]).is_none()); // 5-byte length
         assert_eq!(der_len(&[0x02]), Some((2, 1))); // short form
         assert_eq!(der_len(&[0x82, 0x01, 0x00]), Some((256, 3))); // long form
+    }
+
+    // --- #13: AttestedAppIdentity emission (the bootstrap identity contract) ---
+
+    #[test]
+    fn attested_app_identity_to_public_shapes_fields() {
+        let digest = [0x11u8; 32];
+        let der_bytes = key_description_der_with_app_id(b"chal", b"com.octetproof.sample", &digest);
+        let public = parse_key_description_der(&der_bytes).unwrap().app_id.unwrap().to_public();
+        assert_eq!(public.package_names, vec!["com.octetproof.sample".to_string()]);
+        assert_eq!(public.cert_sha256_digests, vec![digest]);
+    }
+
+    #[test]
+    fn to_public_drops_non_32_byte_digests() {
+        // A digest that isn't 32 bytes can't be a SHA-256, so it's dropped rather
+        // than surfaced as a malformed `[u8; 32]`.
+        let app = AttestationApplicationId {
+            package_names: vec![b"com.x".to_vec()],
+            signature_digests: vec![vec![0x11; 32], vec![0x22; 20]],
+        };
+        assert_eq!(app.to_public().cert_sha256_digests, vec![[0x11u8; 32]]);
+    }
+
+    // --- #11: RootOfTrust parsing + the bootstrap verified-boot gate ---
+
+    /// A `RootOfTrust` SEQUENCE: verifiedBootKey (32 B), deviceLocked, verifiedBootState.
+    fn root_of_trust_der(device_locked: bool, vb_state: u8) -> Vec<u8> {
+        let vbk = der(&[0x04], &[0u8; 32]);
+        let locked = der(&[0x01], &[if device_locked { 0xff } else { 0x00 }]);
+        let state = der(&[0x0a], &[vb_state]);
+        der(&[0x30], &[vbk, locked, state].concat())
+    }
+
+    /// A full KeyDescription carrying `rootOfTrust [704]` in `teeEnforced`.
+    fn key_description_der_with_root_of_trust(challenge: &[u8], device_locked: bool, vb_state: u8) -> Vec<u8> {
+        // [704] EXPLICIT ⇒ its content is the RootOfTrust SEQUENCE directly.
+        let rot_tagged = der(&[0xBF, 0x85, 0x40], &root_of_trust_der(device_locked, vb_state));
+        let software_enforced = der(&[0x30], &[]);
+        let tee_enforced = der(&[0x30], &rot_tagged);
+        let body = [
+            der(&[0x02], &[4]),
+            der(&[0x0a], &[2]),
+            der(&[0x02], &[0x01, 0x2c]),
+            der(&[0x0a], &[2]),
+            der(&[0x04], challenge),
+            der(&[0x04], &[]), // uniqueId
+            software_enforced,
+            tee_enforced,
+        ]
+        .concat();
+        der(&[0x30], &body)
+    }
+
+    #[test]
+    fn parses_root_of_trust_from_tee_enforced() {
+        let kd = parse_key_description_der(&key_description_der_with_root_of_trust(b"chal", true, 0)).unwrap();
+        let rot = kd.root_of_trust.expect("root of trust parsed");
+        assert!(rot.device_locked);
+        assert_eq!(rot.verified_boot_state, VerifiedBootState::Verified);
+        // Strict fields still parse alongside the deep RootOfTrust.
+        assert_eq!(kd.challenge, b"chal");
+    }
+
+    #[test]
+    fn parses_all_verified_boot_states() {
+        for (raw, want) in [
+            (0u8, VerifiedBootState::Verified),
+            (1, VerifiedBootState::SelfSigned),
+            (2, VerifiedBootState::Unverified),
+            (3, VerifiedBootState::Failed),
+        ] {
+            let kd = parse_key_description_der(&key_description_der_with_root_of_trust(b"c", false, raw)).unwrap();
+            let rot = kd.root_of_trust.unwrap();
+            assert_eq!(rot.verified_boot_state, want);
+            assert!(!rot.device_locked);
+        }
+    }
+
+    #[test]
+    fn root_of_trust_absent_is_none() {
+        // The app-id fixture has an empty teeEnforced and no [704].
+        let kd = parse_key_description_der(&key_description_der_with_app_id(b"c", b"com.x", &[0u8; 32])).unwrap();
+        assert!(kd.root_of_trust.is_none());
+    }
+
+    #[test]
+    fn bootstrap_verified_boot_gate() {
+        let rot = |locked, s| Some(RootOfTrust { device_locked: locked, verified_boot_state: s });
+        // Verified + locked passes.
+        assert!(enforce_verified_boot(rot(true, VerifiedBootState::Verified)).is_ok());
+        // Any non-Verified state → unverified-boot.
+        for s in [VerifiedBootState::SelfSigned, VerifiedBootState::Unverified, VerifiedBootState::Failed] {
+            assert_eq!(enforce_verified_boot(rot(true, s)).unwrap_err(), AttestError::AttestationUnverifiedBoot);
+        }
+        // Verified but unlocked → bootloader-unlocked.
+        assert_eq!(
+            enforce_verified_boot(rot(false, VerifiedBootState::Verified)).unwrap_err(),
+            AttestError::AttestationBootloaderUnlocked
+        );
+        // Absent RootOfTrust → fail closed as unverified.
+        assert_eq!(enforce_verified_boot(None).unwrap_err(), AttestError::AttestationUnverifiedBoot);
+    }
+
+    // --- #12: revocation matching (leading-zero-insensitive) ---
+
+    #[test]
+    fn revocation_matching() {
+        let chain: &[&[u8]] = &[&[0x01, 0x02, 0x03], &[0xAA]];
+        assert!(!is_revoked(chain, &[])); // empty set → never revoked
+        assert!(!is_revoked(chain, &[vec![0x09, 0x09]])); // un-revoked
+        assert!(is_revoked(chain, &[vec![0x01, 0x02, 0x03]])); // exact match
+        // Leading zeros ignored on either side.
+        assert!(is_revoked(chain, &[vec![0x00, 0x00, 0xAA]]));
+        assert!(is_revoked(&[&[0x00, 0xAA]], &[vec![0xAA]]));
     }
 }
