@@ -74,6 +74,28 @@ pub enum AttestError {
     #[error("certificate chain does not anchor to a Google hardware-attestation root")]
     KeyAttestNotAnchored,
 
+    /// A certificate OTHER than the leaf carries the Android key-attestation
+    /// extension. This is the chain-extension fix, and it mirrors Google's own
+    /// "chain-extension attack prevention"
+    /// (`android/keyattestation` → `CHAIN_EXTENDED_WITH_FAKE_ATTESTATION_EXTENSION`).
+    ///
+    /// The attack: an attacker holds a real device's attested-key private half,
+    /// so they can sign a forged sub-certificate with it and present
+    /// `[forged_leaf, genuine_device_leaf, …google]`. The verifier would read
+    /// the attestation bytes from the attacker-authored `forged_leaf`. What
+    /// gives the attack away is that `genuine_device_leaf`, now sitting as an
+    /// issuer, still carries its OWN attestation extension — the extension may
+    /// appear only on the target leaf. We do NOT require issuers to be CAs:
+    /// real devices ship non-CA batch certificates, and requiring `CA:TRUE`
+    /// there rejects genuine hardware (which is why Google does not do it).
+    #[error("a non-leaf certificate carries the attestation extension (chain-extension attack)")]
+    KeyAttestChainExtension,
+
+    /// The presented chain has more certificates than the accepted maximum. A
+    /// bound on work done on attacker-supplied input.
+    #[error("certificate chain exceeds the maximum length")]
+    KeyAttestChainTooLong,
+
     /// The Android attestation challenge in the leaf did not match the expected
     /// key-generation challenge.
     #[error("attestation challenge mismatch")]

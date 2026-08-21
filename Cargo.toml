@@ -1,13 +1,11 @@
 [package]
 name = "octet-attest-verify"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2021"
 description = "Offline verification of mobile device-attestation evidence carried on an Octet LocationProof: Apple App Attest (attestation object + assertion, against Apple's static root), Android hardware key-attestation chain validation (to embedded Google roots), and a Google Play Integrity decode helper. No device-side secret or proof-creation logic."
 repository = "https://github.com/octetproof/octet-attest-verify"
 readme = "README.md"
 license = "Apache-2.0"
-# GitHub-only release; `publish = false` guards against an accidental
-# `cargo publish` to crates.io.
 publish = false
 
 [lib]

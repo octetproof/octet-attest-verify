@@ -4,6 +4,39 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.1.1] - 2026-08-21
+
+Security fix for the Android key-attestation path (`verify_key_attestation`).
+Two hardening changes; the public Rust API is unchanged. 2.1.0 is published with
+these flaws, so 2.1.1 supersedes it.
+
+### Fixed
+- **Chain-extension attack: a genuine device leaf could sign a forged leaf.**
+  The chain walk verified each link's signature but not that a signer was
+  permitted to issue certificates, so a real, Google-signed device leaf — whose
+  private key is usable through the ordinary KeyStore signing API — could sign a
+  sub-certificate carrying an attacker-authored attestation extension
+  (challenge, `rootOfTrust`, app identity), and the forged chain was accepted.
+  The extension's **position** is now constrained: the attestation extension
+  (`1.3.6.1.4.1.11129.2.1.17`) may appear only on the target leaf, and any
+  issuer carrying it is rejected. This matches Google's own certificate-path
+  validator, and the chain-length bound is kept. Deliberately **not** added: an
+  RFC 5280 `basicConstraints cA=TRUE` / `keyUsage` requirement on issuers — real
+  devices ship non-CA batch certificates, so that check rejects genuine
+  hardware, which is why Google's verifier omits it too.
+- **RootOfTrust trust order: `softwareEnforced` was consulted before
+  `teeEnforced`.** `extract_root_of_trust` returned the first `rootOfTrust` it
+  found and searched the framework-populated `softwareEnforced` list first, so a
+  device whose hardware `teeEnforced` reported Unverified / unlocked could carry
+  `Verified` + locked in `softwareEnforced` and pass the bootstrap verified-boot
+  gate. The `rootOfTrust` is now read from `teeEnforced` only; a copy found
+  solely in `softwareEnforced` is treated as absent, so the gate fails closed.
+
+### Note on validation
+Certificate-path validation is now covered by a captured genuine-device corpus
+(both pinned roots, TEE and StrongBox security levels, and the RKP chain shape),
+so the hardening is demonstrated not to reject real hardware.
+
 ## [2.1.0] - 2026-08-20
 
 Delivers the bootstrap key-attestation path to the **Python** consumer. The Rust
@@ -24,8 +57,8 @@ API is unchanged from 2.0.0 — this is a binding and packaging release.
 
 ### Note on scope
 Certificate-chain path validation is not changed in this release. Hardening it
-is tracked separately and needs a captured genuine chain first, so the change
-can be shown not to reject real devices; see `test-vectors/`.
+is tracked separately and needs a captured genuine chain first, so that the
+change can be shown not to reject real devices; see `test-vectors/`.
 
 ## [2.0.0] - 2026-08-14
 

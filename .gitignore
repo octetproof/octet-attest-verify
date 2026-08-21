@@ -5,7 +5,7 @@ Cargo.lock.bak
 
 # Local agent / editor state.
 
-# Python caches (scripts/ is tracked in the private source-of-truth repo).
+# Python caches.
 __pycache__/
 *.pyc
 

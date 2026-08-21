@@ -35,6 +35,11 @@ use x509_cert::Certificate;
 /// The Android Key Attestation extension OID.
 const KEY_ATTESTATION_OID: &str = "1.3.6.1.4.1.11129.2.1.17";
 
+/// Upper bound on the presented chain length. Real Android chains are at most
+/// root + two intermediates + leaf (RKP adds one), so anything beyond this is
+/// an attacker padding the input; cap the work before doing per-cert crypto.
+const MAX_CHAIN_LEN: usize = 10;
+
 // Signature-algorithm OIDs we accept up an Android attestation chain.
 const RSA_SHA256_OID: &str = "1.2.840.113549.1.1.11";
 const RSA_SHA384_OID: &str = "1.2.840.113549.1.1.12";
@@ -101,8 +106,9 @@ pub enum AttestMode<'a> {
 }
 
 /// The device's Android RootOfTrust: verified-boot state and bootloader lock.
-/// Parsed from the KeyDescription authorization list (`rootOfTrust [704]`), in
-/// either `teeEnforced` (the usual home) or `softwareEnforced`.
+/// Parsed from the KeyDescription `teeEnforced` authorization list
+/// (`rootOfTrust [704]`) only — a copy in `softwareEnforced` is untrusted and
+/// ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootOfTrust {
     /// `true` iff the bootloader is locked (`deviceLocked`).
@@ -209,6 +215,9 @@ pub fn verify_key_attestation(
     if chain_der.is_empty() {
         return Err(AttestError::MalformedCertChain("empty certificate chain".into()));
     }
+    if chain_der.len() > MAX_CHAIN_LEN {
+        return Err(AttestError::KeyAttestChainTooLong);
+    }
     let certs: Vec<Certificate> = chain_der
         .iter()
         .map(|d| {
@@ -222,9 +231,36 @@ pub fn verify_key_attestation(
         check_validity(c, now_unix_secs)?;
     }
 
-    // 2. Internal linkage: each cert is signed by the next one up.
+    // 2. Internal linkage. For each adjacent pair, `pair[1]` is the issuer of
+    //    `pair[0]`. Two things must hold:
+    //      a. NO issuer may carry the key-attestation extension — it belongs on
+    //         the leaf (the target) alone;
+    //      b. the issuer's key produced the subject's signature.
+    //
+    //    (a) is the chain-extension fix, and it is Google's own defence
+    //    (`android/keyattestation` KeyAttestationCertPathValidator: the target
+    //    must carry the attestation extension and any other cert carrying it is
+    //    CHAIN_EXTENDED_WITH_FAKE_ATTESTATION_EXTENSION). The attack: an
+    //    attacker holds a real device's attested-key private half, signs a
+    //    forged sub-cert with it, and presents `[forged, genuine_device_leaf,
+    //    …]`. The verifier would read the attestation bytes from the
+    //    attacker-authored `forged` at index 0 — but `genuine_device_leaf`, now
+    //    an issuer, still carries its own attestation extension, which betrays
+    //    the extension. We deliberately do NOT require issuers to be CAs: real
+    //    devices ship non-CA `CA:FALSE` batch certificates (e.g. Sony Xperia 10
+    //    III), and requiring CA:TRUE there rejects genuine hardware — which is
+    //    exactly why Google's validator does not require it either.
+    //
+    //    The complementary half — the leaf (certs[0]) MUST carry the extension —
+    //    is enforced by parse_key_description below, which errors if it is
+    //    absent.
     for pair in certs.windows(2) {
-        verify_signed_by(&pair[0], &pair[1])?;
+        let subject = &pair[0];
+        let issuer = &pair[1];
+        if has_key_attestation_extension(issuer) {
+            return Err(AttestError::KeyAttestChainExtension);
+        }
+        verify_signed_by(subject, issuer)?;
     }
 
     // 3. Anchor: the top of the supplied chain must be, or be signed by, a pinned
@@ -323,6 +359,17 @@ fn check_validity(cert: &Certificate, now_unix_secs: u64) -> Result<()> {
 
 /// The top of the provided chain is trusted if it is itself a pinned root, or if
 /// its signature verifies against a pinned root whose subject is its issuer.
+/// Whether `cert` carries the Android key-attestation extension. Used to reject
+/// any issuer that carries it: the extension belongs on the target leaf alone,
+/// and its presence on a non-leaf cert is the chain-extension attack (see
+/// the linkage loop). Not the same as parsing it — presence, not contents.
+fn has_key_attestation_extension(cert: &Certificate) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_some_and(|exts| exts.iter().any(|e| e.extn_id.to_string() == KEY_ATTESTATION_OID))
+}
+
 fn anchor_to_google_root(top: &Certificate) -> Result<()> {
     let top_der = top
         .to_der()
@@ -473,9 +520,10 @@ struct KeyDescription {
     /// could be located and parsed. `None` when absent or unparseable — a caller
     /// that requires app binding treats `None` as a mismatch (fail closed).
     app_id: Option<AttestationApplicationId>,
-    /// The `rootOfTrust [704]` from `teeEnforced` (or `softwareEnforced`), when
-    /// present and parseable. `None` when absent — the bootstrap path treats
-    /// `None` as unverified boot (fail closed).
+    /// The `rootOfTrust [704]` from `teeEnforced` only, when present and
+    /// parseable (a copy in `softwareEnforced` is untrusted and ignored).
+    /// `None` when absent — the bootstrap path treats `None` as unverified boot
+    /// (fail closed).
     root_of_trust: Option<RootOfTrust>,
 }
 
@@ -611,8 +659,10 @@ fn parse_key_description_der(der: &[u8]) -> Result<KeyDescription> {
 }
 
 /// Best-effort walk from just-after-`attestationChallenge` to the `rootOfTrust`
-/// (`[704]`): search `softwareEnforced`, then `teeEnforced` (the spec allows
-/// either; teeEnforced is the usual home). `None` on any deviation — the
+/// (`[704]`) in `teeEnforced` **only**. `softwareEnforced` is walked past but its
+/// rootOfTrust is never read: it is framework-populated, not TA-vouched, so
+/// trusting it inverts the anti-root check. A rootOfTrust found solely in
+/// `softwareEnforced` is thus reported as absent. `None` on any deviation — the
 /// bootstrap caller treats `None` as unverified boot (fail closed).
 ///
 /// ```text
@@ -630,15 +680,22 @@ fn extract_root_of_trust(after_challenge: &[u8]) -> Option<RootOfTrust> {
     if t != 0x04 {
         return None;
     }
-    // softwareEnforced AuthorizationList (SEQUENCE) — check it first.
-    let (t, sw_enforced, rest) = der_tlv(rest)?;
+    // softwareEnforced AuthorizationList (SEQUENCE). Walk PAST it — never read a
+    // rootOfTrust from here. softwareEnforced is populated by the Android
+    // framework / keystore2, not vouched for by the KeyMint TA, so a rootOfTrust
+    // in this list is attacker-influenceable on a rooted or custom-ROM device.
+    // The old code returned this copy first when present, inverting the trust
+    // order on the only anti-root check: a device whose genuine teeEnforced said
+    // Unverified/unlocked could carry Verified+locked in softwareEnforced and
+    // mint a licence (the second finding).
+    let (t, _sw_enforced, rest) = der_tlv(rest)?;
     if t != 0x30 {
         return None;
     }
-    if let Some(rot) = find_root_of_trust(sw_enforced) {
-        return Some(rot);
-    }
-    // teeEnforced AuthorizationList (SEQUENCE) — the usual home for RootOfTrust.
+    // teeEnforced AuthorizationList (SEQUENCE) — the only trusted home for
+    // rootOfTrust. A rootOfTrust present solely in softwareEnforced is therefore
+    // reported as absent, so the bootstrap gate fails closed
+    // (AttestationUnverifiedBoot) rather than trusting the untrusted copy.
     let (t, tee_enforced, _rest) = der_tlv(rest)?;
     if t != 0x30 {
         return None;
@@ -1022,7 +1079,7 @@ mod tests {
         assert_eq!(der_len(&[0x82, 0x01, 0x00]), Some((256, 3))); // long form
     }
 
-    // --- #13: AttestedAppIdentity emission (the bootstrap identity contract) ---
+    // --- AttestedAppIdentity emission (the bootstrap identity contract) ---
 
     #[test]
     fn attested_app_identity_to_public_shapes_fields() {
@@ -1044,7 +1101,7 @@ mod tests {
         assert_eq!(app.to_public().cert_sha256_digests, vec![[0x11u8; 32]]);
     }
 
-    // --- #11: RootOfTrust parsing + the bootstrap verified-boot gate ---
+    // --- RootOfTrust parsing + the bootstrap verified-boot gate ---
 
     /// A `RootOfTrust` SEQUENCE: verifiedBootKey (32 B), deviceLocked, verifiedBootState.
     fn root_of_trust_der(device_locked: bool, vb_state: u8) -> Vec<u8> {
@@ -1106,6 +1163,79 @@ mod tests {
         assert!(kd.root_of_trust.is_none());
     }
 
+    /// A KeyDescription with `rootOfTrust` placed independently in
+    /// `softwareEnforced` and/or `teeEnforced` — for the trust-order tests
+    /// (the second finding). Each `Some((device_locked, vb_state))` emits a
+    /// `[704]` into that list; `None` leaves the list empty.
+    fn key_description_der_split_rot(
+        challenge: &[u8],
+        software: Option<(bool, u8)>,
+        tee: Option<(bool, u8)>,
+    ) -> Vec<u8> {
+        let list = |rot: Option<(bool, u8)>| match rot {
+            Some((locked, state)) => {
+                der(&[0x30], &der(&[0xBF, 0x85, 0x40], &root_of_trust_der(locked, state)))
+            }
+            None => der(&[0x30], &[]),
+        };
+        let body = [
+            der(&[0x02], &[4]),
+            der(&[0x0a], &[2]),
+            der(&[0x02], &[0x01, 0x2c]),
+            der(&[0x0a], &[2]),
+            der(&[0x04], challenge),
+            der(&[0x04], &[]), // uniqueId
+            list(software),
+            list(tee),
+        ]
+        .concat();
+        der(&[0x30], &body)
+    }
+
+    #[test]
+    fn root_of_trust_only_in_software_enforced_is_ignored() {
+        // A rooted / custom-ROM device can populate the framework-controlled
+        // softwareEnforced list with Verified+locked while its genuine
+        // teeEnforced carries no rootOfTrust. That copy must NOT be trusted:
+        // extract reports absent, so the bootstrap gate fails closed. This is
+        // the fix for the second finding — before it, this device minted a
+        // licence.
+        let kd = parse_key_description_der(&key_description_der_split_rot(
+            b"chal",
+            Some((true, 0)), // softwareEnforced: Verified + locked (the lie)
+            None,            // teeEnforced: no rootOfTrust
+        ))
+        .unwrap();
+        assert!(kd.root_of_trust.is_none(), "softwareEnforced rootOfTrust must be ignored");
+        assert_eq!(
+            enforce_verified_boot(kd.root_of_trust).unwrap_err(),
+            AttestError::AttestationUnverifiedBoot,
+        );
+    }
+
+    #[test]
+    fn tee_enforced_root_of_trust_wins_over_software_enforced() {
+        // Both lists carry a rootOfTrust and they disagree: softwareEnforced
+        // claims Verified+locked, the TA-vouched teeEnforced says
+        // Unverified+unlocked. The teeEnforced copy must be the one returned, so
+        // the gate rejects — the softwareEnforced value can never override the
+        // hardware truth. Pinning the tee state (not just "some error") is what
+        // catches a regression back to reading softwareEnforced first.
+        let kd = parse_key_description_der(&key_description_der_split_rot(
+            b"chal",
+            Some((true, 0)),  // softwareEnforced: Verified + locked
+            Some((false, 2)), // teeEnforced: Unverified + unlocked (the truth)
+        ))
+        .unwrap();
+        let rot = kd.root_of_trust.expect("teeEnforced rootOfTrust parsed");
+        assert_eq!(rot.verified_boot_state, VerifiedBootState::Unverified);
+        assert!(!rot.device_locked);
+        assert_eq!(
+            enforce_verified_boot(kd.root_of_trust).unwrap_err(),
+            AttestError::AttestationUnverifiedBoot,
+        );
+    }
+
     #[test]
     fn bootstrap_verified_boot_gate() {
         let rot = |locked, s| Some(RootOfTrust { device_locked: locked, verified_boot_state: s });
@@ -1124,7 +1254,7 @@ mod tests {
         assert_eq!(enforce_verified_boot(None).unwrap_err(), AttestError::AttestationUnverifiedBoot);
     }
 
-    // --- #12: revocation matching (leading-zero-insensitive) ---
+    // --- revocation matching (leading-zero-insensitive) ---
 
     #[test]
     fn revocation_matching() {
