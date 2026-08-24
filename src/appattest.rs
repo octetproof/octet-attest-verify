@@ -102,11 +102,35 @@ pub enum Verdict {
 // verifier rebuilds both from fields already on the proof (commitment = 5,
 // ts = 7, nonce = 10), holding nothing server-side.
 
-/// `clientDataHash` the App Attest assertion is generated over: `SHA256(nonce)`.
-/// Window-level (depends only on the nonce), hence reusable across a cadence
-/// window.
+/// The **nonce-only** `clientDataHash`: `SHA256(nonce)`. This is what the
+/// attestation object, the out-of-band enrolment snapshot, and legacy nonce-only SDKs
+/// generate the assertion over. Window-level (depends only on the nonce), hence
+/// reusable across a cadence window.
+///
+/// The *live per-proof* assertion of a bound-form SDK instead uses the bound form
+/// [`bound_assertion_client_data_hash`]; see [`AssertionBinding`].
 pub fn assertion_client_data_hash(nonce: &[u8]) -> [u8; 32] {
     Sha256::digest(nonce).into()
+}
+
+/// The **bound** `clientDataHash` the *live per-proof* App Attest assertion
+/// is generated over: `SHA256(nonce ‖ signing_key_sec1)`, where
+/// `signing_key_sec1` is the Secure-Enclave proof-signing key — the x9.63 public
+/// bytes carried in `certificate_chain[0]`, the same key
+/// [`verify_device_signature`] checks the field-2 signature against.
+///
+/// Folding the signing key into the assertion binds the window-level assertion
+/// to *the key that actually signs each proof*, so a genuine `(nonce, assertion)`
+/// pair is cryptographically tied to that signing key.
+/// Still window-level: the SE key is stable, so one assertion serves every proof
+/// in the window. The attestation object and enrolment snapshot deliberately
+/// keep the nonce-only [`assertion_client_data_hash`] — they are one-time
+/// bootstraps, not per-proof replay vectors.
+pub fn bound_assertion_client_data_hash(nonce: &[u8], signing_key_sec1: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(nonce);
+    h.update(signing_key_sec1);
+    h.finalize().into()
 }
 
 /// The raw per-proof Secure Enclave challenge: `commitment ‖ ts(8B big-endian)
@@ -421,13 +445,62 @@ pub fn verify_attestation(
     Ok(AttestedKey { public_key_sec1: leaf_pub, last_counter: ad.counter })
 }
 
-/// Verify an assertion against a previously [`AttestedKey`]. Returns the new
-/// (advanced) counter on success; the caller updates the cached key with it.
+/// How a live proof's App Attest assertion `clientDataHash` is reconstructed,
+/// and how strictly the signing-key binding is enforced.
+///
+/// The device SDK signs the *live per-proof* assertion over the **bound** form
+/// `SHA256(nonce ‖ signing_key)`; the attestation object and enrolment
+/// snapshot keep the **nonce-only** form. A verifier picks the mode per call:
+/// `NonceOnly` for the enrol / attestation-object path, and — for live proofs —
+/// `PreferBound` while legacy nonce-only SDKs are still in the field, `RequireBound` once
+/// every SDK emits the bound form (this is what `--require-attestation` selects).
+#[derive(Debug, Clone, Copy)]
+pub enum AssertionBinding<'a> {
+    /// `clientDataHash = SHA256(nonce)`. The enrolment / attestation-object path
+    /// and legacy nonce-only SDKs. No signing key needed.
+    NonceOnly,
+    /// Accept the bound form `SHA256(nonce ‖ signing_key)`, falling back to
+    /// the legacy nonce-only form. Rollout default: both old and bound-form SDKs
+    /// verify. Does NOT yet close the replay — a legacy assertion is still
+    /// accepted, so it confers no signing-key binding; that is `RequireBound`'s
+    /// job once the whole fleet emits the bound form.
+    PreferBound { signing_key_sec1: &'a [u8] },
+    /// Require the bound form; a legacy nonce-only assertion is rejected
+    /// (`AssertionSignatureInvalid`). This is the enforcement posture that
+    /// ties every accepted assertion to the proof-signing key.
+    RequireBound { signing_key_sec1: &'a [u8] },
+}
+
+/// Verify an assertion against a previously [`AttestedKey`], reconstructing the
+/// **nonce-only** `clientDataHash` — the enrolment / attestation-object path and
+/// legacy nonce-only SDKs. Thin wrapper over [`verify_assertion_with_binding`] with
+/// [`AssertionBinding::NonceOnly`]; kept for callers (Python bindings, vectors)
+/// that predate the signing-key binding.
 pub fn verify_assertion(
     assertion: &[u8],
     nonce: &[u8],
     expected_app_id: &AppId,
     key: &AttestedKey,
+) -> Result<u32> {
+    verify_assertion_with_binding(
+        assertion,
+        nonce,
+        expected_app_id,
+        key,
+        AssertionBinding::NonceOnly,
+    )
+}
+
+/// Verify an assertion against a previously [`AttestedKey`], selecting how the
+/// `clientDataHash` is reconstructed and how strictly the signing-key
+/// binding is enforced (see [`AssertionBinding`]). Returns the new (advanced)
+/// counter on success; the caller updates the cached key with it.
+pub fn verify_assertion_with_binding(
+    assertion: &[u8],
+    nonce: &[u8],
+    expected_app_id: &AppId,
+    key: &AttestedKey,
+    binding: AssertionBinding,
 ) -> Result<u32> {
     use p256::ecdsa::signature::Verifier;
 
@@ -440,25 +513,41 @@ pub fn verify_assertion(
         .and_then(|a| a.as_bytes())
         .ok_or_else(|| AttestError::MalformedAttestation("no authenticatorData".into()))?;
 
-    // App Attest assertion (per Apple's validation steps): the device computes
-    //   nonce = SHA256(authenticatorData ‖ clientDataHash)
-    // and signs that 32-byte nonce with the attested P-256 key. ES256 applies
-    // its own SHA-256, so the signature is over SHA256(nonce). We must therefore
-    // verify against `nonce` — NOT the raw `authenticatorData ‖ clientDataHash`
-    // concatenation, which omits Apple's intermediate SHA-256 (that only ever
-    // self-verified against synthetic assertions built the same wrong way; a
-    // real device-produced assertion fails it).
-    let client_data_hash = assertion_client_data_hash(nonce);
-    let mut to_hash = auth_data.clone();
-    to_hash.extend_from_slice(&client_data_hash);
-    let assertion_nonce: [u8; 32] = Sha256::digest(&to_hash).into();
-
     let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_key_sec1)
         .map_err(|_| AttestError::AssertionSignatureInvalid)?;
     let sig = p256::ecdsa::Signature::from_der(signature)
         .map_err(|_| AttestError::AssertionSignatureInvalid)?;
-    vk.verify(&assertion_nonce, &sig)
-        .map_err(|_| AttestError::AssertionSignatureInvalid)?;
+
+    // App Attest assertion (per Apple's validation steps): the device computes
+    //   nonce = SHA256(authenticatorData ‖ clientDataHash)
+    // and signs that 32-byte value with the attested P-256 key. ES256 applies
+    // its own SHA-256, so the signature is over that value — NOT the raw
+    // `authenticatorData ‖ clientDataHash` concatenation. The only thing the bound form
+    // changes is `clientDataHash`; we reconstruct it per `binding` and verify.
+    // `SHA256(nonce)` and `SHA256(nonce ‖ signing_key)` are disjoint, so an
+    // assertion made for one form never verifies under the other — a bound
+    // assertion fails `NonceOnly`, a legacy assertion fails `RequireBound`, and
+    // a bound assertion paired with a *different* signing key fails too (that is
+    // exactly the replay the binding defeats).
+    let verifies = |client_data_hash: [u8; 32]| -> bool {
+        let mut to_hash = auth_data.to_vec();
+        to_hash.extend_from_slice(&client_data_hash);
+        let assertion_nonce: [u8; 32] = Sha256::digest(&to_hash).into();
+        vk.verify(&assertion_nonce, &sig).is_ok()
+    };
+    let ok = match binding {
+        AssertionBinding::NonceOnly => verifies(assertion_client_data_hash(nonce)),
+        AssertionBinding::RequireBound { signing_key_sec1 } => {
+            verifies(bound_assertion_client_data_hash(nonce, signing_key_sec1))
+        }
+        AssertionBinding::PreferBound { signing_key_sec1 } => {
+            verifies(bound_assertion_client_data_hash(nonce, signing_key_sec1))
+                || verifies(assertion_client_data_hash(nonce))
+        }
+    };
+    if !ok {
+        return Err(AttestError::AssertionSignatureInvalid);
+    }
 
     let ad = parse_auth_data(auth_data, false)?;
     if ad.rp_id_hash != expected_app_id.0 {
@@ -716,6 +805,127 @@ mod tests {
         let assertion = make_assertion(&sk, &ad, &[9u8; 32]);
         assert_eq!(
             verify_assertion(&assertion, &[8u8; 32], &app_id, &attested_key(&sk)),
+            Err(AttestError::AssertionSignatureInvalid)
+        );
+    }
+
+    // --- the bound assertion form (SHA256(nonce ‖ signing_key)) ---
+
+    fn sec1_of(seed: u8) -> Vec<u8> {
+        // A real SEC1 P-256 point stands in for certificate_chain[0] (the SE
+        // proof-signing key); the verifier folds its bytes into clientDataHash.
+        SigningKey::from_slice(&[seed; 32])
+            .unwrap()
+            .verifying_key()
+            .to_sec1_bytes()
+            .to_vec()
+    }
+
+    /// Mirror a bound-form device: sign the bound clientDataHash
+    /// `SHA256(nonce ‖ signing_key)`, folding the SE signing key into the assertion.
+    fn make_bound_assertion(
+        sk: &SigningKey,
+        auth_data: &[u8],
+        nonce: &[u8],
+        signing_key_sec1: &[u8],
+    ) -> Vec<u8> {
+        let mut to_hash = auth_data.to_vec();
+        to_hash.extend_from_slice(&bound_assertion_client_data_hash(nonce, signing_key_sec1));
+        let assertion_nonce: [u8; 32] = Sha256::digest(&to_hash).into();
+        let sig: Signature = sk.sign(&assertion_nonce);
+        let value = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("signature".into()),
+                ciborium::value::Value::Bytes(sig.to_der().as_bytes().to_vec()),
+            ),
+            (
+                ciborium::value::Value::Text("authenticatorData".into()),
+                ciborium::value::Value::Bytes(auth_data.to_vec()),
+            ),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&value, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn bound_assertion_verifies_under_prefer_and_require() {
+        let sk = test_key();
+        let app_id = AppId::from_team_and_bundle("T", "b");
+        let nonce = [9u8; 32];
+        let signing = sec1_of(0x11);
+        let ad = assertion_auth_data(&app_id.0, 5);
+        let assertion = make_bound_assertion(&sk, &ad, &nonce, &signing);
+        let key = attested_key(&sk);
+        assert_eq!(
+            verify_assertion_with_binding(
+                &assertion, &nonce, &app_id, &key,
+                AssertionBinding::RequireBound { signing_key_sec1: &signing }
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            verify_assertion_with_binding(
+                &assertion, &nonce, &app_id, &key,
+                AssertionBinding::PreferBound { signing_key_sec1: &signing }
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn require_bound_rejects_legacy_but_prefer_bound_accepts_it() {
+        // The rollout contract: RequireBound refuses a legacy nonce-only
+        // assertion (enforcement), while PreferBound still accepts it — so the
+        // verifier can ship before every SDK emits the bound form.
+        let sk = test_key();
+        let app_id = AppId::from_team_and_bundle("T", "b");
+        let nonce = [9u8; 32];
+        let signing = sec1_of(0x11);
+        let ad = assertion_auth_data(&app_id.0, 5);
+        let legacy = make_assertion(&sk, &ad, &nonce);
+        assert_eq!(
+            verify_assertion_with_binding(
+                &legacy, &nonce, &app_id, &attested_key(&sk),
+                AssertionBinding::RequireBound { signing_key_sec1: &signing }
+            ),
+            Err(AttestError::AssertionSignatureInvalid)
+        );
+        assert_eq!(
+            verify_assertion_with_binding(
+                &legacy, &nonce, &app_id, &attested_key(&sk),
+                AssertionBinding::PreferBound { signing_key_sec1: &signing }
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn bound_assertion_is_disjoint_from_nonce_only_and_bound_to_the_key() {
+        // A bound assertion does not verify under the nonce-only reconstruction
+        // (the 4-arg wrapper) — the two clientDataHash forms are disjoint...
+        let sk = test_key();
+        let app_id = AppId::from_team_and_bundle("T", "b");
+        let nonce = [9u8; 32];
+        let signing = sec1_of(0x11);
+        let ad = assertion_auth_data(&app_id.0, 5);
+        let bound = make_bound_assertion(&sk, &ad, &nonce, &signing);
+        assert_eq!(
+            verify_assertion(&bound, &nonce, &app_id, &attested_key(&sk)),
+            Err(AttestError::AssertionSignatureInvalid)
+        );
+        // ...and it commits to THIS signing key: pairing the same genuine
+        // assertion with a different signing key fails under RequireBound —
+        // exactly what the binding defeats.
+        let other = sec1_of(0x22);
+        assert_eq!(
+            verify_assertion_with_binding(
+                &bound, &nonce, &app_id, &attested_key(&sk),
+                AssertionBinding::RequireBound { signing_key_sec1: &other }
+            ),
             Err(AttestError::AssertionSignatureInvalid)
         );
     }

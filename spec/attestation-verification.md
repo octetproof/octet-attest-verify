@@ -69,14 +69,26 @@ fully offline.
 
 ### 2.2 `clientDataHash`
 
-Both `attestKey` and the per-window assertion are computed by the SDK over:
+The attestation object (§2.3) and the out-of-band enrolment snapshot use the
+**nonce-only** form:
 
 ```
 clientDataHash = SHA256(attestation_nonce)
 ```
 
-This is window-level (depends only on the nonce), which is what lets one verdict
-cover a cadence window.
+The **live per-proof assertion** (§2.4) of a bound-form SDK uses the **bound**
+form, which additionally commits the Secure-Enclave proof-signing key
+(`certificate_chain[0]`, the same key §2.5 checks field 2 against):
+
+```
+clientDataHash = SHA256(attestation_nonce ‖ certificate_chain[0])
+```
+
+Both are window-level (they depend only on the nonce and the stable SE key),
+which is what lets one verdict cover a cadence window. The bound form ties the
+window assertion to the key that actually signs each proof. The attestation
+object and the enrolment snapshot stay nonce-only — one-time bootstraps, not
+per-proof assertions.
 
 ### 2.3 Attestation object verification (first proof of a key)
 
@@ -100,7 +112,12 @@ On success the recovered public key is trusted for this `key_id`.
 
 ### 2.4 Assertion verification (every proof)
 
-1. `clientDataHash = SHA256(attestation_nonce)` (§2.2).
+1. `clientDataHash = SHA256(attestation_nonce ‖ certificate_chain[0])` — the
+   **bound** form (§2.2), reconstructed from the proof alone. Legacy SDKs used
+   the nonce-only `SHA256(attestation_nonce)`; a verifier either accepts both
+   forms (`PreferBound`) or requires the bound form (`RequireBound`). The two
+   forms are disjoint, so an assertion made for one never verifies under the
+   other.
 2. The assertion is CBOR `{ signature, authenticatorData }`. Verify `signature`
    (ECDSA-P256) over `SHA256(authenticatorData ‖ clientDataHash)` using the
    public key cached for `key_id` (§2.3). If no key is cached, the verdict is

@@ -4,6 +4,32 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.2.0] - 2026-08-24
+
+Adds an iOS App Attest **signing-key binding** for the live per-proof assertion.
+Additive: the existing `verify_assertion` signature is unchanged, so current
+callers keep the nonce-only behaviour.
+
+### Added
+- **`bound_assertion_client_data_hash(nonce, signing_key_sec1)`** — reconstructs
+  the bound `clientDataHash = SHA256(nonce ‖ signing_key)`, which commits the
+  Secure-Enclave proof-signing key (`certificate_chain[0]`) into the live
+  per-proof App Attest assertion, tying the window assertion to the key that
+  signs each proof.
+- **`AssertionBinding`** (`NonceOnly` / `PreferBound` / `RequireBound`) and
+  **`verify_assertion_with_binding(..)`** — select how the assertion
+  `clientDataHash` is reconstructed and how strictly the binding is enforced.
+  `NonceOnly` is the enrol / attestation-object path; `PreferBound` accepts the
+  bound or the legacy nonce-only form; `RequireBound` accepts only the bound
+  form. `verify_assertion(..)` now delegates to
+  `verify_assertion_with_binding(.., NonceOnly)`.
+
+### Notes
+- iOS only. Android's StrongBox key both signs and is attested, so its
+  attestation is already bound to the signing key; no change there.
+- The spec's §2.2 / §2.4 (`spec/attestation-verification.md`) document the bound
+  form as the live-assertion contract.
+
 ## [2.1.1] - 2026-08-21
 
 Security fix for the Android key-attestation path (`verify_key_attestation`).
