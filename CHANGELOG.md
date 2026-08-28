@@ -4,6 +4,24 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.2.1] - 2026-08-28
+
+Release-tooling patch. **No change to the crate's verification logic** — the Rust
+API and behaviour are identical to 2.2.0. This release exists to publish a
+**self-identifying Python wheel**: 2.1.1 and 2.2.0 shipped an identically named
+wheel (same filename and version string), so a fetched artefact could not be told
+apart from its name alone.
+
+### Changed
+- The PyO3 wheel now stamps the wrapped crate version, exposed as
+  `octet_attest_verify.__attest_crate_version__` (plus `__version__` for the
+  binding), and the binding version is `0.2.2` — so every release ships a
+  distinguishable, self-identifying wheel.
+- The wheel publish workflow fails closed on version drift (the stamped crate
+  version must equal the release tag's `VERSION`) and on a wheel-filename
+  collision across releases, and records the wheel SHA-256 as a release asset so
+  a consumer can pin the artefact by hash.
+
 ## [2.2.0] - 2026-08-24
 
 Adds an iOS App Attest **signing-key binding** for the live per-proof assertion.
