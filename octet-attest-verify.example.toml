@@ -21,8 +21,9 @@ environment = "production"
 [play_integrity]
 # The Cloud project NUMBER (numeric) the app's Play Integrity is linked to.
 cloud_project_number = 123456789012
-# The package name the token must be for.
-package_name = "com.example.app"
+# Accepted package name(s) — the decoded token's requestPackageName must be one
+# of these (e.g. a public build plus an internal/variant build).
+package_names = ["com.example.app", "com.example.app.internal"]
 # Path to the service-account JSON used to decode tokens.
 # IMPORTANT: keep this file local and OUT of source control — reference by path.
 service_account_json = "/secrets/play-integrity-sa.json"

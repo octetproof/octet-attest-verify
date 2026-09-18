@@ -4,6 +4,51 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+## [2.3.0] - 2026-09-16
+
+Play Integrity pass-policy gate + offline-primitive extensions (#37, #39), toward
+verifiable per-proof PI. Offline-only; no new runtime dependencies; no change to
+any existing verification path. #39 pins the pass-policy golden vectors shared
+as a shared cross-implementation reference.
+
+### Added
+- `IntegrityVerdict::check_binding_packages(nonce, Option<&[&str]>)` — accept a
+  **set** of allowed packages (`requestPackageName` ∈ set), so a public build and an
+  internal/variant build can share one config. The single-package `check_binding`
+  is kept as a convenience wrapper (backward-compatible).
+- `IntegrityVerdict` now parses `requestDetails.timestampMillis` (exposed as
+  `timestamp_ms`) and gains `check_freshness(now_ms, max_age_ms)` — a **window**
+  freshness check (a Play Integrity token is reused across proofs within a cadence
+  window, so this is deliberately not a per-proof uniqueness check; each proof binds
+  independently via its device-attestation signature). Missing/implausible timestamps
+  fail closed via new `PlayIntegrityError::{MissingTimestamp, TimestampOutOfWindow}`
+  (wheel slugs `integrity_missing_timestamp` / `integrity_timestamp_out_of_window`).
+- `IntegrityVerdict::check_device_integrity()` — the **shared reference** for the
+  device-integrity gate: passes on
+  `MEETS_DEVICE_INTEGRITY` **or** `MEETS_STRONG_INTEGRITY`; `MEETS_BASIC_INTEGRITY`,
+  an empty verdict array, and an absent `deviceIntegrity` field all fail closed via
+  new `PlayIntegrityError::DeviceIntegrityInsufficient`.
+- New `DeviceIntegrity::MeetsStrong` variant so `MEETS_STRONG_INTEGRITY` is
+  recognised (previously unmodelled — a STRONG-only token misclassified as `None`).
+  Classification now picks the strongest label present.
+- `test-vectors/playintegrity/vectors.json` + `tests/playintegrity_vectors.rs` — the
+  15 pass-policy vectors + 1 malformed-JSON case shared byte-for-byte with the SDK's
+  a shared cross-implementation reference kept in lockstep across the crate and both
+  SDKs stay lockstep.
+
+### Fixed
+- The `playintegrity` Python binding (`check_play_integrity`) rejected
+  `MEETS_STRONG_INTEGRITY`-only tokens as `device_integrity_insufficient` — the
+  strongest verdict was falling through to the reject arm. STRONG now passes the gate.
+
+### Changed
+- **Breaking (feature `playintegrity` config, no current consumer):**
+  `PlayIntegrityConfig.package_name: String` → `package_names: Vec<String>`
+  (TOML: `package_name = "…"` → `package_names = ["…", …]`). No proof-verification
+  behaviour changes.
+
 ## [2.2.1] - 2026-08-28
 
 Release-tooling patch. **No change to the crate's verification logic** — the Rust

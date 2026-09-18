@@ -14,7 +14,9 @@
 //!
 //! [play_integrity]                  # optional; only for the Android path
 //! cloud_project_number = 123456789012
-//! package_name         = "com.example.app"
+//! # One or more accepted package names — the decoded token's requestPackageName
+//! # must be one of these (e.g. a public + an internal build variant).
+//! package_names        = ["com.example.app", "com.example.app.internal"]
 //! # Path to the service-account JSON used to decode tokens. NEVER commit this
 //! # file — keep it local and reference it by path.
 //! service_account_json = "/secrets/play-integrity-sa.json"
@@ -74,8 +76,10 @@ impl From<Environment> for crate::appattest::AcceptEnvironment {
 pub struct PlayIntegrityConfig {
     /// The Cloud project number the app's Play Integrity is linked to.
     pub cloud_project_number: u64,
-    /// The app package name the token is expected to be for.
-    pub package_name: String,
+    /// The app package name(s) the token is accepted for — the decoded token's
+    /// `requestPackageName` must be one of these. A set so a public build and an
+    /// internal/variant build (e.g. `…` and `….internal`) can share one config.
+    pub package_names: Vec<String>,
     /// Path to the service-account JSON used to decode tokens. Referenced by
     /// path only — the file is never read into config and never committed.
     pub service_account_json: Option<String>,
@@ -127,7 +131,7 @@ mod tests {
 
             [play_integrity]
             cloud_project_number = 123456789012
-            package_name = "com.octetproof.tester"
+            package_names = ["com.octetproof.tester", "com.octetproof.tester.internal"]
             service_account_json = "/secrets/sa.json"
             "#,
         )
@@ -136,7 +140,12 @@ mod tests {
         let aa = cfg.app_attest.as_ref().unwrap();
         assert_eq!(aa.team_id, "6ZH5F97PWU");
         assert_eq!(aa.environment, Environment::Development);
-        assert_eq!(cfg.play_integrity.as_ref().unwrap().cloud_project_number, 123456789012);
+        let pi = cfg.play_integrity.as_ref().unwrap();
+        assert_eq!(pi.cloud_project_number, 123456789012);
+        assert_eq!(
+            pi.package_names,
+            vec!["com.octetproof.tester".to_string(), "com.octetproof.tester.internal".to_string()]
+        );
         // expected_app_id matches the documented App ID hash.
         assert_eq!(
             cfg.expected_app_id().unwrap(),

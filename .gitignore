@@ -22,4 +22,9 @@ __pycache__/
 # under test-vectors/ stay tracked; only the captured artifacts are ignored.
 /test-vectors/appattest/*.bin
 /test-vectors/appattest/meta.txt
-/test-vectors/playintegrity/
+# Play Integrity: ignore any captured real-token artifacts, but keep the
+# synthetic shared golden vectors + README tracked (they are source-of-truth,
+# no real device data — see test-vectors/playintegrity/README.md).
+/test-vectors/playintegrity/*
+!/test-vectors/playintegrity/vectors.json
+!/test-vectors/playintegrity/README.md

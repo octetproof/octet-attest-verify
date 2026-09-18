@@ -29,11 +29,18 @@ pub struct IntegrityVerdict {
     /// The nonce echoed back in the token (raw bytes, base64-decoded), for
     /// binding to the proof's `attestation_nonce`.
     pub nonce: Vec<u8>,
+    /// The token's `requestDetails.timestampMillis` (ms since epoch) when present
+    /// and parseable, for the optional freshness-window check. `None` if the
+    /// field is absent or not a valid integer.
+    pub timestamp_ms: Option<i64>,
 }
 
 /// Device-integrity level from the token's `deviceIntegrity` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceIntegrity {
+    /// Met `MEETS_STRONG_INTEGRITY` (hardware-backed boot integrity — the
+    /// strongest signal, implies device integrity).
+    MeetsStrong,
     /// Met `MEETS_DEVICE_INTEGRITY` (genuine, uncompromised device).
     MeetsDevice,
     /// Only basic integrity (`MEETS_BASIC_INTEGRITY`).
@@ -60,9 +67,20 @@ pub enum PlayIntegrityError {
     Malformed(String),
     #[error("token nonce does not match the proof nonce")]
     NonceMismatch,
-    #[error("token package name does not match the expected package")]
+    #[error("device integrity verdict is below the accepted band")]
+    DeviceIntegrityInsufficient,
+    #[error("token package name is not one of the accepted packages")]
     PackageMismatch,
+    #[error("token carries no parseable timestampMillis")]
+    MissingTimestamp,
+    #[error("token timestamp is outside the accepted freshness window")]
+    TimestampOutOfWindow,
 }
+
+/// Clock-skew tolerance for the freshness window: a token whose timestamp is up
+/// to this far in the future is still accepted (matches the proof-freshness
+/// skew used elsewhere in the pipeline).
+const CLOCK_SKEW_MS: i64 = 60_000;
 
 // --- Decoded-payload JSON shape (subset we consume) ---
 
@@ -81,6 +99,9 @@ struct RequestDetails {
     #[serde(rename = "requestPackageName")]
     request_package_name: Option<String>,
     nonce: Option<String>,
+    /// Play Integrity carries this as a string of ms-since-epoch (e.g. "1700000000000").
+    #[serde(rename = "timestampMillis")]
+    timestamp_millis: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +135,12 @@ impl IntegrityVerdict {
             .device_integrity
             .and_then(|d| d.device_recognition_verdict)
         {
+            // Verdicts nest — STRONG implies DEVICE implies BASIC — and a real
+            // token carries the whole ladder it qualifies for. Classify to the
+            // strongest label present so STRONG never reads as a weaker band.
+            Some(labels) if labels.iter().any(|l| l == "MEETS_STRONG_INTEGRITY") => {
+                DeviceIntegrity::MeetsStrong
+            }
             Some(labels) if labels.iter().any(|l| l == "MEETS_DEVICE_INTEGRITY") => {
                 DeviceIntegrity::MeetsDevice
             }
@@ -133,15 +160,18 @@ impl IntegrityVerdict {
             _ => AppRecognition::Unevaluated,
         };
 
-        let (request_package_name, nonce) = match payload.request_details {
+        let (request_package_name, nonce, timestamp_ms) = match payload.request_details {
             Some(rd) => {
                 let nonce = match rd.nonce {
                     Some(n) => decode_nonce(&n)?,
                     None => Vec::new(),
                 };
-                (rd.request_package_name, nonce)
+                // timestampMillis is a decimal string; a non-numeric value is
+                // treated as absent (None) rather than a hard parse error.
+                let timestamp_ms = rd.timestamp_millis.as_deref().and_then(|s| s.parse::<i64>().ok());
+                (rd.request_package_name, nonce, timestamp_ms)
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), None),
         };
 
         Ok(IntegrityVerdict {
@@ -149,26 +179,97 @@ impl IntegrityVerdict {
             app_recognition,
             request_package_name,
             nonce,
+            timestamp_ms,
         })
     }
 
     /// Confirm the token binds to the proof: its nonce equals the proof's
-    /// `attestation_nonce` and (if an expected package is given) its package
-    /// matches.
+    /// `attestation_nonce` and (if an expected package is given) its
+    /// `requestPackageName` matches.
+    ///
+    /// The nonce is a random per-window value the SDK echoes into the token and
+    /// stores as the proof's `attestation_nonce`; this is a byte-equality check,
+    /// **not** a recomputation — the nonce is not derived from anything. The
+    /// proof's commitment/timestamp are tied to this same nonce by the separate
+    /// device-attestation (field-2) signature, so the token is bound to *this*
+    /// proof through that, not through the nonce's contents.
+    ///
+    /// Single-package convenience over [`check_binding_packages`]; new code that
+    /// accepts a set of packages (e.g. a public + an internal build variant)
+    /// should call that directly.
     pub fn check_binding(
         &self,
         expected_nonce: &[u8],
         expected_package: Option<&str>,
     ) -> Result<(), PlayIntegrityError> {
+        match expected_package {
+            Some(p) => self.check_binding_packages(expected_nonce, Some(&[p])),
+            None => self.check_binding_packages(expected_nonce, None),
+        }
+    }
+
+    /// Like [`check_binding`] but accepts a **set** of accepted packages — the
+    /// token's `requestPackageName` must be one of them. Use this when one config
+    /// serves multiple package names (e.g. `com.x` + `com.x.internal`). `None`
+    /// checks the nonce only; an empty slice accepts no package.
+    pub fn check_binding_packages(
+        &self,
+        expected_nonce: &[u8],
+        expected_packages: Option<&[&str]>,
+    ) -> Result<(), PlayIntegrityError> {
         if self.nonce != expected_nonce {
             return Err(PlayIntegrityError::NonceMismatch);
         }
-        if let Some(pkg) = expected_package {
-            if self.request_package_name.as_deref() != Some(pkg) {
-                return Err(PlayIntegrityError::PackageMismatch);
+        if let Some(pkgs) = expected_packages {
+            match self.request_package_name.as_deref() {
+                Some(pkg) if pkgs.contains(&pkg) => {}
+                _ => return Err(PlayIntegrityError::PackageMismatch),
             }
         }
         Ok(())
+    }
+
+    /// Confirm the token's `timestampMillis` is fresh: no older than `max_age_ms`
+    /// and not implausibly in the future (beyond [`CLOCK_SKEW_MS`]).
+    ///
+    /// Within a Play Integrity cadence window the token — and thus this
+    /// timestamp — is **reused** across proofs, so this is a WINDOW freshness
+    /// check, never a per-proof uniqueness check: identical tokens across proofs
+    /// in a window are expected, and each proof binds independently via its own
+    /// device-attestation signature. A token with no parseable timestamp fails
+    /// closed ([`PlayIntegrityError::MissingTimestamp`]) so an absent value can
+    /// never silently pass.
+    pub fn check_freshness(&self, now_ms: i64, max_age_ms: i64) -> Result<(), PlayIntegrityError> {
+        let ts = self.timestamp_ms.ok_or(PlayIntegrityError::MissingTimestamp)?;
+        if ts > now_ms.saturating_add(CLOCK_SKEW_MS) {
+            return Err(PlayIntegrityError::TimestampOutOfWindow); // implausibly future
+        }
+        if now_ms.saturating_sub(ts) > max_age_ms {
+            return Err(PlayIntegrityError::TimestampOutOfWindow); // stale
+        }
+        Ok(())
+    }
+
+    /// Confirm the token meets the device-integrity gate. This is the **shared
+    /// reference** for the pass policy locked with the SDK: the token passes on
+    /// `MEETS_DEVICE_INTEGRITY` **or** `MEETS_STRONG_INTEGRITY` (STRONG folds in
+    /// as the stronger signal). Everything weaker fails **closed** —
+    /// `MEETS_BASIC_INTEGRITY`, an empty `deviceRecognitionVerdict` array, and a
+    /// `deviceIntegrity` field that is absent entirely all map to
+    /// [`DeviceIntegrityError::DeviceIntegrityInsufficient`](PlayIntegrityError::DeviceIntegrityInsufficient)
+    /// — so a missing or unevaluated verdict can never silently pass.
+    ///
+    /// This gate is deliberately independent of nonce/package binding
+    /// ([`check_binding_packages`](Self::check_binding_packages)) and freshness
+    /// ([`check_freshness`](Self::check_freshness)); a full pass composes all
+    /// three.
+    pub fn check_device_integrity(&self) -> Result<(), PlayIntegrityError> {
+        match self.device_integrity {
+            DeviceIntegrity::MeetsStrong | DeviceIntegrity::MeetsDevice => Ok(()),
+            DeviceIntegrity::MeetsBasic | DeviceIntegrity::None => {
+                Err(PlayIntegrityError::DeviceIntegrityInsufficient)
+            }
+        }
     }
 }
 
@@ -216,6 +317,7 @@ mod tests {
         assert_eq!(v.app_recognition, AppRecognition::PlayRecognized);
         assert_eq!(v.request_package_name.as_deref(), Some("com.octetproof.tester"));
         assert_eq!(v.nonce, nonce);
+        assert_eq!(v.timestamp_ms, Some(1_700_000_000_000));
     }
 
     #[test]
@@ -247,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_checks_nonce_and_package() {
+    fn binding_checks_nonce_and_package_set() {
         let nonce = [7u8; 32];
         let b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
         let v = IntegrityVerdict::from_decoded_json(&sample(
@@ -257,14 +359,138 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(v.check_binding(&nonce, Some("com.octetproof.tester")).is_ok());
+        // Package ∈ the accepted set (public + internal variant) passes.
+        assert!(v
+            .check_binding_packages(&nonce, Some(&["com.octetproof.sample", "com.octetproof.tester"]))
+            .is_ok());
+        // A single-element set still works.
+        assert!(v.check_binding_packages(&nonce, Some(&["com.octetproof.tester"])).is_ok());
+        // None checks nonce only.
+        assert!(v.check_binding_packages(&nonce, None).is_ok());
+        // Wrong nonce → NonceMismatch (checked before package).
         assert_eq!(
-            v.check_binding(&[0u8; 32], Some("com.octetproof.tester")),
+            v.check_binding_packages(&[0u8; 32], Some(&["com.octetproof.tester"])),
             Err(PlayIntegrityError::NonceMismatch)
         );
+        // Package not in the set → PackageMismatch.
+        assert_eq!(
+            v.check_binding_packages(&nonce, Some(&["com.evil.app", "com.other.app"])),
+            Err(PlayIntegrityError::PackageMismatch)
+        );
+        // Empty accepted set rejects any package.
+        assert_eq!(
+            v.check_binding_packages(&nonce, Some(&[])),
+            Err(PlayIntegrityError::PackageMismatch)
+        );
+
+        // The single-package convenience wrapper still works (backward-compat).
+        assert!(v.check_binding(&nonce, Some("com.octetproof.tester")).is_ok());
+        assert!(v.check_binding(&nonce, None).is_ok());
         assert_eq!(
             v.check_binding(&nonce, Some("com.evil.app")),
             Err(PlayIntegrityError::PackageMismatch)
+        );
+    }
+
+    #[test]
+    fn freshness_window_accepts_recent_rejects_stale_future_and_missing() {
+        let nonce = [8u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
+        // Token timestamp = 1_700_000_000_000 (from the sample).
+        let v = IntegrityVerdict::from_decoded_json(&sample(
+            &b64,
+            "PLAY_RECOGNIZED",
+            "MEETS_DEVICE_INTEGRITY",
+        ))
+        .unwrap();
+        let ts = 1_700_000_000_000i64;
+        let max_age = 300_000; // 5 min window
+
+        // now shortly after ts, within max_age → fresh.
+        assert!(v.check_freshness(ts + 120_000, max_age).is_ok());
+        // now == ts → fresh.
+        assert!(v.check_freshness(ts, max_age).is_ok());
+        // older than max_age → stale.
+        assert_eq!(
+            v.check_freshness(ts + max_age + 1, max_age),
+            Err(PlayIntegrityError::TimestampOutOfWindow)
+        );
+        // token timestamp implausibly in the future (beyond skew) → rejected.
+        assert_eq!(
+            v.check_freshness(ts - CLOCK_SKEW_MS - 1, max_age),
+            Err(PlayIntegrityError::TimestampOutOfWindow)
+        );
+        // within skew into the future → accepted.
+        assert!(v.check_freshness(ts - CLOCK_SKEW_MS + 1, max_age).is_ok());
+
+        // A token with no timestamp fails closed.
+        let no_ts = IntegrityVerdict::from_decoded_json(
+            r#"{ "requestDetails": { "nonce": "AAAA" },
+                 "deviceIntegrity": { "deviceRecognitionVerdict": ["MEETS_DEVICE_INTEGRITY"] } }"#,
+        )
+        .unwrap();
+        assert_eq!(no_ts.timestamp_ms, None);
+        assert_eq!(
+            no_ts.check_freshness(ts, max_age),
+            Err(PlayIntegrityError::MissingTimestamp)
+        );
+    }
+
+    #[test]
+    fn strong_integrity_folds_into_device_gate() {
+        // A STRONG-only verdict (highest band) must classify as MeetsStrong and
+        // pass the device gate — the regression this change fixes.
+        let nonce = [3u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
+        let v = IntegrityVerdict::from_decoded_json(&sample(
+            &b64,
+            "PLAY_RECOGNIZED",
+            "MEETS_STRONG_INTEGRITY",
+        ))
+        .unwrap();
+        assert_eq!(v.device_integrity, DeviceIntegrity::MeetsStrong);
+        assert!(v.check_device_integrity().is_ok());
+
+        // When the whole ladder is present, classify to the strongest.
+        let laddered = IntegrityVerdict::from_decoded_json(&format!(
+            r#"{{ "requestDetails": {{ "nonce": "{b64}" }},
+                  "deviceIntegrity": {{ "deviceRecognitionVerdict":
+                    ["MEETS_BASIC_INTEGRITY", "MEETS_DEVICE_INTEGRITY", "MEETS_STRONG_INTEGRITY"] }} }}"#
+        ))
+        .unwrap();
+        assert_eq!(laddered.device_integrity, DeviceIntegrity::MeetsStrong);
+    }
+
+    #[test]
+    fn device_gate_passes_device_and_strong_fails_closed_otherwise() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode([4u8; 32]);
+        let gate = |device_json: &str| {
+            IntegrityVerdict::from_decoded_json(&format!(
+                r#"{{ "requestDetails": {{ "nonce": "{b64}" }}, "deviceIntegrity": {device_json} }}"#
+            ))
+            .unwrap()
+            .check_device_integrity()
+        };
+        assert!(gate(r#"{ "deviceRecognitionVerdict": ["MEETS_DEVICE_INTEGRITY"] }"#).is_ok());
+        assert!(gate(r#"{ "deviceRecognitionVerdict": ["MEETS_STRONG_INTEGRITY"] }"#).is_ok());
+        // Basic, empty array, and absent field all fail closed.
+        assert_eq!(
+            gate(r#"{ "deviceRecognitionVerdict": ["MEETS_BASIC_INTEGRITY"] }"#),
+            Err(PlayIntegrityError::DeviceIntegrityInsufficient)
+        );
+        assert_eq!(
+            gate(r#"{ "deviceRecognitionVerdict": [] }"#),
+            Err(PlayIntegrityError::DeviceIntegrityInsufficient)
+        );
+        // deviceIntegrity absent entirely.
+        let absent = IntegrityVerdict::from_decoded_json(&format!(
+            r#"{{ "requestDetails": {{ "nonce": "{b64}" }} }}"#
+        ))
+        .unwrap();
+        assert_eq!(absent.device_integrity, DeviceIntegrity::None);
+        assert_eq!(
+            absent.check_device_integrity(),
+            Err(PlayIntegrityError::DeviceIntegrityInsufficient)
         );
     }
 

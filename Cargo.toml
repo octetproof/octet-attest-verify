@@ -1,6 +1,6 @@
 [package]
 name = "octet-attest-verify"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2021"
 description = "Offline verification of mobile device-attestation evidence carried on an Octet LocationProof: Apple App Attest (attestation object + assertion, against Apple's static root), Android hardware key-attestation chain validation (to embedded Google roots), and a Google Play Integrity decode helper. No device-side secret or proof-creation logic."
 repository = "https://github.com/octetproof/octet-attest-verify"
@@ -58,3 +58,7 @@ base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
+# Shared Play Integrity golden-vector harness (tests/playintegrity_vectors.rs);
+# only compiled with `--features playintegrity`.
+serde_json = "1"
+base64 = "0.22"
