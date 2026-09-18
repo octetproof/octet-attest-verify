@@ -6,6 +6,18 @@ follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-09-18
+
+Wheel-identity patch. **No change to the crate's Rust API or verification logic**
+vs 2.3.0. Bumps the Python binding version (`0.2.2` → `0.2.3`) so the binding
+changes already in 2.3.0 (the Play Integrity `MEETS_STRONG_INTEGRITY` fix in
+`check_play_integrity`) ship in a distinguishable wheel — the 2.3.0 wheel publish
+was blocked by the self-identifying-wheel guard (#35) because the binding version
+had not moved.
+
+### Changed
+- Python binding version `0.2.2` → `0.2.3` (one distinguishable wheel per release).
+
 ## [2.3.0] - 2026-09-16
 
 Play Integrity pass-policy gate + offline-primitive extensions (#37, #39), toward
