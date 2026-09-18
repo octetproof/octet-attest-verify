@@ -59,6 +59,28 @@ Given the proof's `certificate_chain` and the expected key-generation challenge,
 Offline, like App Attest. It does **not** check online revocation (Google's
 status list) — see [spec §3.1](spec/attestation-verification.md).
 
+## What it checks (Play Integrity, `--features playintegrity`)
+
+Turning the opaque Play Integrity token into a verdict is bound to your Google
+Play Console project, so that decode step is the integrator's (Google's
+`decodeIntegrityToken`, or local decryption with the project keys). Given the
+**already-decoded** payload, this crate normalises it to an `IntegrityVerdict`
+and applies the pass policy:
+
+1. `check_device_integrity()` — the device-integrity gate: passes on
+   `MEETS_DEVICE_INTEGRITY` **or** `MEETS_STRONG_INTEGRITY`; `MEETS_BASIC_INTEGRITY`,
+   an empty verdict, or an absent field fail closed.
+2. `check_binding` / `check_binding_packages` — the token's nonce equals the
+   proof's `attestation_nonce` (raw byte compare, standard **and** URL-safe
+   base64, padding optional) and its `requestPackageName` is one of the expected
+   packages.
+3. `check_freshness(now_ms, max_age_ms)` — the token's `timestampMillis` is within
+   the freshness window, tolerating a small forward clock skew. A Play Integrity
+   token is reused across proofs within a cadence window, so this is a window
+   check, not per-proof uniqueness.
+
+`appRecognitionVerdict` and `appLicensingVerdict` are surfaced but never gate.
+
 ## Wire contract
 
 The exact byte layouts the verifier reconstructs are specified, language-
@@ -68,9 +90,11 @@ proofs and with any non-Rust re-implementation.
 
 ## Status
 
-`1.0.0`. The App Attest offline core, the Android key-attestation layer, and the
-shared spec are the focus. The Android key-attestation accept path is validated
-on real hardware; the Play Integrity decode helper is wired against a live token.
+`2.3.2`. The App Attest offline core, the Android key-attestation layer, the Play
+Integrity pass-policy helpers, and the shared spec are all in place. Both offline
+attestation layers (App Attest and Android key attestation) are validated on real
+hardware; the Play Integrity pass policy runs against decoded tokens. See
+[CHANGELOG.md](CHANGELOG.md) for the per-release detail.
 
 ## License
 

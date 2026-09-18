@@ -6,6 +6,22 @@ follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-09-18
+
+Hygiene patch. **No change to the crate's Rust API or verification logic** vs
+2.3.1.
+
+### Fixed
+- The Play Integrity golden-vector test (`tests/playintegrity_vectors.rs`) now
+  **skips cleanly when its vector fixture is absent**, matching the other vector
+  tests. The fixtures are a private, unpublished dependency, so on a published
+  checkout `cargo test --features playintegrity` previously failed on the missing
+  file; it now skips (the crate's `playintegrity` unit tests carry the logic).
+
+### Changed
+- Documentation and test-comment wording clarified.
+- Python binding version `0.2.3` → `0.2.4` (one distinguishable wheel per release).
+
 ## [2.3.1] - 2026-09-18
 
 Wheel-identity patch. **No change to the crate's Rust API or verification logic**
@@ -22,8 +38,8 @@ had not moved.
 
 Play Integrity pass-policy gate + offline-primitive extensions (#37, #39), toward
 verifiable per-proof PI. Offline-only; no new runtime dependencies; no change to
-any existing verification path. #39 pins the pass-policy golden vectors shared
-as a shared cross-implementation reference.
+any existing verification path. #39 pins the pass-policy golden vectors as a
+shared cross-implementation reference.
 
 ### Added
 - `IntegrityVerdict::check_binding_packages(nonce, Option<&[&str]>)` — accept a
@@ -46,9 +62,8 @@ as a shared cross-implementation reference.
   recognised (previously unmodelled — a STRONG-only token misclassified as `None`).
   Classification now picks the strongest label present.
 - `test-vectors/playintegrity/vectors.json` + `tests/playintegrity_vectors.rs` — the
-  15 pass-policy vectors + 1 malformed-JSON case shared byte-for-byte with the SDK's
-  a shared cross-implementation reference kept in lockstep across the crate and both
-  SDKs stay lockstep.
+  15 pass-policy vectors + 1 malformed-JSON case, a shared cross-implementation
+  reference kept in lockstep across the crate and the mobile clients.
 
 ### Fixed
 - The `playintegrity` Python binding (`check_play_integrity`) rejected
