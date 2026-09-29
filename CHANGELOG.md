@@ -6,7 +6,20 @@ follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 
 ## [Unreleased]
 
-## [2.3.2] - 2026-09-18
+## [2.3.3] - 2026-09-29
+
+Additive Python-binding change; **no change to the crate's Rust API or
+verification logic** vs 2.3.2 (the value was already computed on
+`KeyAttestation.leaf_pubkey_sec1`).
+
+### Changed
+- **Python binding: `verify_key_attestation` now also returns the attested leaf
+  key** as `device_key_sec1` (raw SEC1) — `(package_names, cert_sha256_digests,
+  device_key_sec1)`. It is the device key that was attested (not the app-signing
+  cert), **device-stable across attestations of the same hardware key and
+  independent of the per-attestation challenge**, so a consumer can hash it into a
+  stable key identity (e.g. to bind a client-supplied device fingerprint). Always
+  present on success. Wheel/binding bumped to 0.2.5.
 
 Hygiene patch. **No change to the crate's Rust API or verification logic** vs
 2.3.1.
