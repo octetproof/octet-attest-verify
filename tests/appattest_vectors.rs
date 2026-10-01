@@ -63,7 +63,7 @@ fn real_device_vector_verifies_end_to_end() {
     let key = verify_attestation(&attestation, &nonce, &app_id, &key_id, env)
         .expect("real attestation object must verify to Apple's root");
 
-    // #38 / #317: this is a *bound-form* vector — the assertion's clientDataHash
+    // /: this is a *bound-form* vector — the assertion's clientDataHash
     // is SHA256(nonce ‖ cert0), where cert0 is the Secure-Enclave signing key.
     // The App Attest key and the SE signing key are distinct by design (this is
     // exactly why iOS needs the binding, not a key-equality check).
@@ -80,14 +80,14 @@ fn real_device_vector_verifies_end_to_end() {
         &key,
         AssertionBinding::RequireBound { signing_key_sec1: &cert0 },
     )
-    .expect("real #317 assertion must verify under RequireBound with the genuine SE key");
+    .expect("real assertion must verify under RequireBound with the genuine SE key");
     eprintln!("real-device bound-form vector verified; assertion counter = {counter}");
 
-    // The legacy nonce-only form MUST fail on a #317 bound assertion — proving
+    // The legacy nonce-only form MUST fail on a bound assertion — proving
     // the signature genuinely commits to SHA256(nonce ‖ cert0), not SHA256(nonce).
     assert!(
         verify_assertion(&assertion, &nonce, &app_id, &key).is_err(),
-        "a #317 bound assertion must NOT verify under the legacy nonce-only form"
+        "a bound assertion must NOT verify under the legacy nonce-only form"
     );
 
     // RequireBound with a DIFFERENT signing key must fail — this is the replay

@@ -4,7 +4,18 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.4.1] - 2026-10-01
+
+Release-hygiene patch. **No change to the crate's Rust API, the Python binding's
+API, or verification logic vs 2.4.0** — the match-any work from 2.4.0 is intact.
+
+### Changed
+- The release pipeline now strips internal tracker references and the in-progress
+  changelog section from the published snapshot and crate, with a fail-closed
+  scan backstop, so neither can reach the public mirror or crates.io. Supersedes
+  2.4.0 (yanked); use 2.4.1.
+- Python binding bumped to 0.2.7 for wheel-artefact identity only; its API is
+  unchanged.
 
 ## [2.4.0] - 2026-09-30
 
@@ -65,7 +76,7 @@ Wheel-identity patch. **No change to the crate's Rust API or verification logic*
 vs 2.3.0. Bumps the Python binding version (`0.2.2` → `0.2.3`) so the binding
 changes already in 2.3.0 (the Play Integrity `MEETS_STRONG_INTEGRITY` fix in
 `check_play_integrity`) ship in a distinguishable wheel — the 2.3.0 wheel publish
-was blocked by the self-identifying-wheel guard (#35) because the binding version
+was blocked by the self-identifying-wheel guard because the binding version
 had not moved.
 
 ### Changed
@@ -73,9 +84,9 @@ had not moved.
 
 ## [2.3.0] - 2026-09-16
 
-Play Integrity pass-policy gate + offline-primitive extensions (#37, #39), toward
+Play Integrity pass-policy gate + offline-primitive extensions, toward
 verifiable per-proof PI. Offline-only; no new runtime dependencies; no change to
-any existing verification path. #39 pins the pass-policy golden vectors as a
+any existing verification path. pins the pass-policy golden vectors as a
 shared cross-implementation reference.
 
 ### Added
