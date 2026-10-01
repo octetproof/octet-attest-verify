@@ -6,6 +6,30 @@ follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-09-30
+
+Additive Rust API for binding a key to any of several registered app identities;
+existing behaviour and the Python binding's API are unchanged.
+
+### Added
+- **`verify_key_attestation_multi`** — verify an Android key-attestation chain
+  against a **set** of expected app identities, accepting the key iff its
+  attested `attestationApplicationId` matches ONE listed identity in full (that
+  identity's package **and** its own signing-cert digest). The match is
+  per-identity atomic: it is deliberately not a cross-product of the listed
+  packages with the listed certs, so a package paired with a *different* listed
+  identity's cert is rejected (the case that arises when a licence registers
+  release and debug certs across multiple package flavours). An empty set is the
+  hardware-root-only posture.
+
+### Changed
+- `verify_key_attestation` is now a thin wrapper over
+  `verify_key_attestation_multi` — its `expected_app: Option<…>` is exactly the
+  set-of-one (or empty) case. Signature and behaviour are unchanged; existing
+  callers need no change.
+- Python binding bumped to 0.2.6 for wheel-artefact identity only (it wraps the
+  new crate version); the binding's Python API is unchanged.
+
 ## [2.3.3] - 2026-09-29
 
 Additive Python-binding change; **no change to the crate's Rust API or

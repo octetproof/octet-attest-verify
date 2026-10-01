@@ -205,11 +205,46 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// The returned [`KeyAttestation`] carries the parsed [`AttestedAppIdentity`] and
 /// [`RootOfTrust`] for the caller to inspect (e.g. the bootstrap identity
 /// comparison), independent of the opt-in `expected_app` match.
+///
+/// `expected_app` binds the key to a SINGLE app identity (or `None` for the
+/// hardware-root-only posture). To accept any of several registered identities
+/// — e.g. one licence covering multiple package flavours, each with its release
+/// and debug signing certs — use [`verify_key_attestation_multi`]; this function
+/// is exactly its set-of-one (or empty) case.
 pub fn verify_key_attestation(
     chain_der: &[Vec<u8>],
     expected_challenge: &[u8],
     now_unix_secs: u64,
     expected_app: Option<&ExpectedAppIdentity>,
+    mode: AttestMode,
+) -> Result<KeyAttestation> {
+    // Set-of-one (or empty) view over the single identity — no clone: `from_ref`
+    // borrows it as a length-1 slice, `None` becomes the empty slice.
+    let expected_apps = expected_app.map(std::slice::from_ref).unwrap_or(&[]);
+    verify_key_attestation_multi(
+        chain_der,
+        expected_challenge,
+        now_unix_secs,
+        expected_apps,
+        mode,
+    )
+}
+
+/// Like [`verify_key_attestation`], but binds the attested key to ONE OF a set of
+/// app identities: the attested `attestationApplicationId` must match a single
+/// listed identity in full (its package AND its own signing-cert digest). An
+/// empty `expected_apps` is the hardware-root-only posture (identical to
+/// `verify_key_attestation` with `expected_app = None`).
+///
+/// The match is per-identity atomic — never a cross-product of the listed
+/// packages with the listed certs — so a package paired with a *different*
+/// listed identity's cert is rejected. This is the multi-flavour licence case
+/// (e.g. `…​.internal` and `…​.studio`, each registering release + debug certs).
+pub fn verify_key_attestation_multi(
+    chain_der: &[Vec<u8>],
+    expected_challenge: &[u8],
+    now_unix_secs: u64,
+    expected_apps: &[ExpectedAppIdentity],
     mode: AttestMode,
 ) -> Result<KeyAttestation> {
     if chain_der.is_empty() {
@@ -273,13 +308,19 @@ pub fn verify_key_attestation(
     if kd.challenge != expected_challenge {
         return Err(AttestError::AttestChallengeMismatch);
     }
-    // App-identity binding (opt-in). When an expected identity is supplied, the
-    // attested `attestationApplicationId` must name that package and carry that
-    // signing-cert digest; a missing/unparseable id fails closed. Omitted ⇒ the
-    // hardware root is checked but the key is not bound to any app (prior behavior).
-    if let Some(expected) = expected_app {
+    // App-identity binding (opt-in). When one or more expected identities are
+    // supplied, the attested `attestationApplicationId` must match ONE of them
+    // IN FULL — that identity's package AND its own signing-cert digest, together.
+    // This is deliberately per-identity atomic (`any(|e| app_id.matches(e))`) and
+    // never a cross-product of "some listed package ∧ some listed cert": a licence
+    // registers both release and debug certs, so its identity set has mixed certs,
+    // and a union-of-packages × union-of-certs check would accept a package paired
+    // with another identity's cert. A missing/unparseable id fails closed. An empty
+    // set ⇒ the hardware root is checked but the key is not bound to any app
+    // (the prior `expected_app == None` behavior).
+    if !expected_apps.is_empty() {
         match &kd.app_id {
-            Some(app_id) if app_id.matches(expected) => {}
+            Some(app_id) if expected_apps.iter().any(|e| app_id.matches(e)) => {}
             _ => return Err(AttestError::AndroidAppIdentityMismatch),
         }
     }
@@ -1054,6 +1095,70 @@ mod tests {
             package_name: "com.octetproof.sample".into(),
             signing_cert_sha256: [0x22; 32],
         }));
+    }
+
+    // --- match-any over a set of identities (multi-flavour licence) ---
+    //
+    // A licence covering `….internal` and `….studio`, each registering its
+    // release and debug signing certs, resolves to a SET of expected identities.
+    // The verifier accepts the attested key iff it matches ONE listed identity in
+    // full — the per-identity-atomic rule `any(|e| pkg==e.pkg && cert==e.cert)`,
+    // the exact expression `verify_key_attestation_multi` evaluates. These tests
+    // pin that it is never the cross-product `any_pkg ∧ any_cert`.
+
+    const STUDIO: &[u8] = b"com.octetproof.sample.studio";
+    const RELEASE_CERT: [u8; 32] = [0xAA; 32];
+    const DEBUG_CERT: [u8; 32] = [0xBB; 32];
+
+    /// The attested app id, parsed via the real DER path, for `(package, cert)`.
+    fn attested(package: &[u8], cert: &[u8; 32]) -> AttestationApplicationId {
+        let der_bytes = key_description_der_with_app_id(b"chal", package, cert);
+        parse_key_description_der(&der_bytes).unwrap().app_id.unwrap()
+    }
+
+    fn id(package: &[u8], cert: [u8; 32]) -> ExpectedAppIdentity {
+        ExpectedAppIdentity {
+            package_name: String::from_utf8(package.to_vec()).unwrap(),
+            signing_cert_sha256: cert,
+        }
+    }
+
+    /// The set-membership decision `verify_key_attestation_multi` makes.
+    fn matches_one(app: &AttestationApplicationId, set: &[ExpectedAppIdentity]) -> bool {
+        set.iter().any(|e| app.matches(e))
+    }
+
+    #[test]
+    fn match_any_accepts_a_key_matching_one_listed_identity() {
+        let set = [id(INTERNAL, RELEASE_CERT), id(STUDIO, DEBUG_CERT)];
+        // A key attesting the studio debug build matches the 2nd listed identity.
+        assert!(matches_one(&attested(STUDIO, &DEBUG_CERT), &set));
+        // …and the internal release build matches the 1st.
+        assert!(matches_one(&attested(INTERNAL, &RELEASE_CERT), &set));
+        // Set-of-one still works (the single-identity posture as a slice).
+        assert!(matches_one(
+            &attested(INTERNAL, &RELEASE_CERT),
+            &[id(INTERNAL, RELEASE_CERT)]
+        ));
+    }
+
+    #[test]
+    fn match_any_rejects_the_cross_product_mixed_certs() {
+        // The canonical cross-product reject vector: the set pairs each package
+        // with a DIFFERENT cert. A proof pairing one package with the OTHER
+        // identity's cert matches neither identity atomically — but WOULD pass a
+        // union-of-packages × union-of-certs check. It must FAIL.
+        let set = [id(INTERNAL, RELEASE_CERT), id(STUDIO, DEBUG_CERT)];
+        assert!(
+            !matches_one(&attested(INTERNAL, &DEBUG_CERT), &set),
+            "internal package + studio's debug cert must not match (cross-product hole)"
+        );
+        assert!(
+            !matches_one(&attested(STUDIO, &RELEASE_CERT), &set),
+            "studio package + internal's release cert must not match (cross-product hole)"
+        );
+        // A package/cert neither of which is listed also fails.
+        assert!(!matches_one(&attested(b"com.evil.app", &[0xCC; 32]), &set));
     }
 
     #[test]
