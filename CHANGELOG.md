@@ -4,6 +4,25 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.5.0] - 2026-10-07
+
+Additive: a helper to date an App Attest attestation object's certificate chain.
+Existing verification behaviour and the Python binding's API are unchanged.
+
+### Added
+- **`appattest::attestation_chain_validity`** and **`ChainValidity`**: read when
+  an App Attest attestation object's certificate chain (leaf, intermediate and the
+  embedded Apple root) is valid, as Unix seconds. `verify_attestation` checks the
+  chain's signatures but not its dates, since the leaf is valid for only about 3
+  days from attestation; a caller with a trusted time for the attestation (such as
+  when the object was anchored) checks it with `ChainValidity::contains`. The
+  function parses the object without verifying it: use it on an object
+  `verify_attestation` has accepted.
+
+### Changed
+- Python binding bumped to 0.2.8 for wheel-artefact identity only; its API is
+  unchanged.
+
 ## [2.4.1] - 2026-10-01
 
 Release-hygiene patch. **No change to the crate's Rust API, the Python binding's

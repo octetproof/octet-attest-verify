@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use octet_attest_verify::appattest::{
-    verify_assertion, verify_assertion_with_binding, verify_attestation, AcceptEnvironment, AppId,
-    AssertionBinding,
+    attestation_chain_validity, verify_assertion, verify_assertion_with_binding, verify_attestation,
+    AcceptEnvironment, AppId, AssertionBinding, ChainValidity,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -106,4 +106,32 @@ fn real_device_vector_verifies_end_to_end() {
         .is_err(),
         "a bound assertion must NOT verify against a different signing key (replay defense)"
     );
+}
+
+/// The chain dates of a real iPhone 11 attestation object (com.octetproof.sample,
+/// team 6ZH5F97PWU): leaf 2026-08-23 11:13:52 to 2026-08-26 11:13:52 UTC,
+/// intermediate (Apple App Attestation CA 1) 2020-03-18 18:39:55 to 2030-03-13,
+/// embedded root 2020-03-18 18:32:53 to 2045-03-15. The chain is valid while all
+/// three are, so the leaf bounds it on both sides. Skips when the vector is absent.
+#[test]
+fn real_device_chain_validity_is_the_leafs_window() {
+    let path = vectors_dir().join("iphone11-attestation-object.bin");
+    let Ok(obj) = std::fs::read(&path) else {
+        eprintln!("skipping: no {} (see README)", path.display());
+        return;
+    };
+    let v = attestation_chain_validity(&obj).expect("real attestation object parses");
+    assert_eq!(
+        v,
+        ChainValidity { leaf_not_before: 1_787_483_632, not_before: 1_787_483_632, not_after: 1_787_742_832 }
+    );
+    assert!(v.contains(1_787_483_632) && v.contains(1_787_742_832), "bounds are inclusive");
+    assert!(!v.contains(1_787_483_631), "one second before the leaf is valid");
+    assert!(!v.contains(1_787_742_833), "one second after the leaf expires");
+}
+
+#[test]
+fn chain_validity_rejects_a_non_attestation_object() {
+    assert!(attestation_chain_validity(b"not cbor").is_err());
+    assert!(attestation_chain_validity(&[]).is_err());
 }

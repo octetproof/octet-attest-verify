@@ -445,6 +445,54 @@ pub fn verify_attestation(
     Ok(AttestedKey { public_key_sec1: leaf_pub, last_counter: ad.counter })
 }
 
+/// When an attestation object's certificate chain is valid: the span in which
+/// the leaf, the intermediate and the embedded Apple root are all within their
+/// `notBefore`..`notAfter`. Unix seconds, inclusive.
+///
+/// [`verify_attestation`] checks the chain's signatures but not its dates,
+/// because the leaf is valid for only about 3 days from attestation and the
+/// object is checked long after. A caller that has a trusted time for the
+/// attestation (for example, when the object was anchored) checks it against
+/// this span instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainValidity {
+    /// The leaf certificate's own `notBefore`: about when the key was attested.
+    pub leaf_not_before: u64,
+    /// The latest `notBefore` across the chain.
+    pub not_before: u64,
+    /// The earliest `notAfter` across the chain.
+    pub not_after: u64,
+}
+
+impl ChainValidity {
+    /// Whether every certificate in the chain is valid at `unix_secs`.
+    pub fn contains(&self, unix_secs: u64) -> bool {
+        self.not_before <= unix_secs && unix_secs <= self.not_after
+    }
+}
+
+/// Read the validity dates of an attestation object's chain (see
+/// [`ChainValidity`]). It parses the object; it does **not** verify it. Use it
+/// only on an object [`verify_attestation`] has accepted, so the dates are
+/// those of a chain that signs up to the Apple root.
+pub fn attestation_chain_validity(attestation_object: &[u8]) -> Result<ChainValidity> {
+    let obj = parse_attestation_object(attestation_object)?;
+    let leaf = Certificate::from_der(&obj.x5c[0])
+        .map_err(|e| AttestError::MalformedCertChain(format!("leaf: {e}")))?;
+    let intermediate = Certificate::from_der(&obj.x5c[1])
+        .map_err(|e| AttestError::MalformedCertChain(format!("intermediate: {e}")))?;
+    let span = |c: &Certificate| {
+        let v = &c.tbs_certificate.validity;
+        (v.not_before.to_unix_duration().as_secs(), v.not_after.to_unix_duration().as_secs())
+    };
+    let spans = [span(&leaf), span(&intermediate), span(&crate::root::root())];
+    Ok(ChainValidity {
+        leaf_not_before: spans[0].0,
+        not_before: spans.iter().map(|s| s.0).max().unwrap_or(0),
+        not_after: spans.iter().map(|s| s.1).min().unwrap_or(0),
+    })
+}
+
 /// How a live proof's App Attest assertion `clientDataHash` is reconstructed,
 /// and how strictly the signing-key binding is enforced.
 ///

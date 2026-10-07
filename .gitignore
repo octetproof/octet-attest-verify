@@ -21,6 +21,8 @@ __pycache__/
 # never commit (see test-vectors/appattest/README.md). Helper scripts + READMEs
 # under test-vectors/ stay tracked; only the captured artifacts are ignored.
 /test-vectors/appattest/*.bin
+# Already public in octet-verify's iPhone 11 vector: Apple certs + public key only.
+!/test-vectors/appattest/iphone11-attestation-object.bin
 /test-vectors/appattest/meta.txt
 # Play Integrity: ignore any captured real-token artifacts, but keep the
 # synthetic shared golden vectors + README tracked (they are source-of-truth,
