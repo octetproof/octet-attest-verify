@@ -13,6 +13,9 @@
 //!   network, no secrets — the trust anchor is a public Apple root baked into
 //!   the crate.
 //!
+//! * [`bridge`] — the app-to-web bridge signature: the device key's signature
+//!   over a web page's report, made through a native WebView bridge.
+//!
 //! * [`playintegrity`] (feature `playintegrity`) — a **Google Play Integrity**
 //!   decode helper. Unlike App Attest, Play Integrity tokens cannot be verified
 //!   offline: decoding is bound to a Google Play Console project. This layer is
@@ -34,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 pub mod appattest;
+pub mod bridge;
 pub mod error;
 pub mod root;
 

@@ -133,6 +133,21 @@ pub fn bound_assertion_client_data_hash(nonce: &[u8], signing_key_sec1: &[u8]) -
     h.finalize().into()
 }
 
+/// Domain-separation prefix of the Secure Enclave binding assertion (see
+/// [`se_binding_client_data_hash`]).
+pub const SE_BINDING_DOMAIN: &[u8] = b"octet-se-binding-v1";
+
+/// The `clientDataHash` of the one-time assertion that binds a Secure Enclave
+/// key to an App Attest key: `SHA256(utf8("octet-se-binding-v1") ‖ se_pub)`,
+/// where `se_pub` is the raw uncompressed P-256 point (65 bytes, `0x04 ‖ x ‖ y`).
+/// Verify that assertion with [`verify_assertion_with_client_data_hash`].
+pub fn se_binding_client_data_hash(se_pub: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(SE_BINDING_DOMAIN);
+    h.update(se_pub);
+    h.finalize().into()
+}
+
 /// The raw per-proof Secure Enclave challenge: `commitment ‖ ts(8B big-endian)
 /// ‖ nonce`. Returned unhashed; see [`se_client_data_hash`] for the value the
 /// SE key actually signs.
@@ -385,11 +400,71 @@ pub fn verify_attestation(
     key_id: &[u8],
     accept_env: AcceptEnvironment,
 ) -> Result<AttestedKey> {
+    // clientDataHash = SHA256(nonce).
+    let client_data_hash = assertion_client_data_hash(nonce);
+    verify_attestation_cdh(attestation_object, &client_data_hash, expected_app_id, key_id, accept_env)
+        .map(|(key, _)| key)
+}
+
+/// An attestation object accepted by [`verify_attestation_with_client_data_hash`].
+#[derive(Debug, Clone)]
+pub struct VerifiedAttestation {
+    /// The attested App Attest key, with the attestation's counter (0). Pass it
+    /// to [`verify_assertion_with_client_data_hash`]; an assertion must then
+    /// carry a counter above 0, so nothing has to be stored between calls.
+    pub key: AttestedKey,
+    /// The environment read from the attestation's AAGUID.
+    pub environment: AttestEnvironment,
+    /// The chain's validity dates. `leaf_not_before` is about when the key was
+    /// attested, for a caller that limits the key's age.
+    pub validity: ChainValidity,
+}
+
+/// Verify an attestation object generated over a caller-supplied
+/// `clientDataHash`, for a stateless verifier that checks the attestation again
+/// on every request.
+///
+/// It runs every check [`verify_attestation`] runs (chain to the embedded Apple
+/// root, nonce, App ID, environment, `key_id`), with `client_data_hash` in place
+/// of `SHA256(nonce)`. It also checks the chain's dates at `now_unix_secs`: every
+/// certificate's `notBefore` has passed, and the intermediate and the Apple root
+/// have not expired. The leaf's own `notAfter` is **not** checked: Apple issues
+/// the leaf for about 3 days, while the attested key stays valid for as long as
+/// the app keeps it, so a stateless verifier sees the leaf long after it has
+/// expired.
+///
+/// `attStmt.receipt` is not read, so an object with the receipt removed (and
+/// re-encoded) verifies the same way.
+pub fn verify_attestation_with_client_data_hash(
+    attestation_object: &[u8],
+    client_data_hash: &[u8; 32],
+    expected_app_id: &AppId,
+    key_id: &[u8],
+    accept_env: AcceptEnvironment,
+    now_unix_secs: u64,
+) -> Result<VerifiedAttestation> {
+    let (key, environment) =
+        verify_attestation_cdh(attestation_object, client_data_hash, expected_app_id, key_id, accept_env)?;
+    let spans = chain_spans(&parse_attestation_object(attestation_object)?)?;
+    let started = spans.iter().all(|(not_before, _)| *not_before <= now_unix_secs);
+    let ca_current = spans[1..].iter().all(|(_, not_after)| now_unix_secs <= *not_after);
+    if !(started && ca_current) {
+        return Err(AttestError::CertExpired);
+    }
+    Ok(VerifiedAttestation { key, environment, validity: validity_of(&spans) })
+}
+
+fn verify_attestation_cdh(
+    attestation_object: &[u8],
+    client_data_hash: &[u8; 32],
+    expected_app_id: &AppId,
+    key_id: &[u8],
+    accept_env: AcceptEnvironment,
+) -> Result<(AttestedKey, AttestEnvironment)> {
     crate::root::verify_pin()?;
     let obj = parse_attestation_object(attestation_object)?;
 
-    // Apple nonce = SHA256(authData ‖ clientDataHash), clientDataHash = SHA256(nonce).
-    let client_data_hash = assertion_client_data_hash(nonce);
+    // Apple nonce = SHA256(authData ‖ clientDataHash).
     let apple_nonce: [u8; 32] = {
         let mut h = Sha256::new();
         h.update(&obj.auth_data);
@@ -442,7 +517,7 @@ pub fn verify_attestation(
         return Err(AttestError::KeyIdMismatch);
     }
 
-    Ok(AttestedKey { public_key_sec1: leaf_pub, last_counter: ad.counter })
+    Ok((AttestedKey { public_key_sec1: leaf_pub, last_counter: ad.counter }, env))
 }
 
 /// When an attestation object's certificate chain is valid: the span in which
@@ -477,6 +552,12 @@ impl ChainValidity {
 /// those of a chain that signs up to the Apple root.
 pub fn attestation_chain_validity(attestation_object: &[u8]) -> Result<ChainValidity> {
     let obj = parse_attestation_object(attestation_object)?;
+    Ok(validity_of(&chain_spans(&obj)?))
+}
+
+/// `(notBefore, notAfter)` in Unix seconds of the leaf, the intermediate and the
+/// embedded Apple root, in that order.
+fn chain_spans(obj: &AttestationObject) -> Result<[(u64, u64); 3]> {
     let leaf = Certificate::from_der(&obj.x5c[0])
         .map_err(|e| AttestError::MalformedCertChain(format!("leaf: {e}")))?;
     let intermediate = Certificate::from_der(&obj.x5c[1])
@@ -485,12 +566,15 @@ pub fn attestation_chain_validity(attestation_object: &[u8]) -> Result<ChainVali
         let v = &c.tbs_certificate.validity;
         (v.not_before.to_unix_duration().as_secs(), v.not_after.to_unix_duration().as_secs())
     };
-    let spans = [span(&leaf), span(&intermediate), span(&crate::root::root())];
-    Ok(ChainValidity {
+    Ok([span(&leaf), span(&intermediate), span(&crate::root::root())])
+}
+
+fn validity_of(spans: &[(u64, u64); 3]) -> ChainValidity {
+    ChainValidity {
         leaf_not_before: spans[0].0,
         not_before: spans.iter().map(|s| s.0).max().unwrap_or(0),
         not_after: spans.iter().map(|s| s.1).min().unwrap_or(0),
-    })
+    }
 }
 
 /// How a live proof's App Attest assertion `clientDataHash` is reconstructed,
@@ -550,6 +634,51 @@ pub fn verify_assertion_with_binding(
     key: &AttestedKey,
     binding: AssertionBinding,
 ) -> Result<u32> {
+    // `SHA256(nonce)` and `SHA256(nonce ‖ signing_key)` are disjoint, so an
+    // assertion made for one form never verifies under the other — a bound
+    // assertion fails `NonceOnly`, a legacy assertion fails `RequireBound`, and
+    // a bound assertion paired with a *different* signing key fails too (that is
+    // exactly the replay the binding defeats).
+    match binding {
+        AssertionBinding::NonceOnly => {
+            verify_assertion_cdh(assertion, &[assertion_client_data_hash(nonce)], expected_app_id, key)
+        }
+        AssertionBinding::RequireBound { signing_key_sec1 } => verify_assertion_cdh(
+            assertion,
+            &[bound_assertion_client_data_hash(nonce, signing_key_sec1)],
+            expected_app_id,
+            key,
+        ),
+        AssertionBinding::PreferBound { signing_key_sec1 } => verify_assertion_cdh(
+            assertion,
+            &[bound_assertion_client_data_hash(nonce, signing_key_sec1), assertion_client_data_hash(nonce)],
+            expected_app_id,
+            key,
+        ),
+    }
+}
+
+/// Verify an assertion generated over a caller-supplied `clientDataHash`, such
+/// as [`se_binding_client_data_hash`]. The counter must be above
+/// `key.last_counter`: with the key from
+/// [`verify_attestation_with_client_data_hash`] (counter 0) that is `counter > 0`
+/// and needs no stored state. Returns the assertion's counter.
+pub fn verify_assertion_with_client_data_hash(
+    assertion: &[u8],
+    client_data_hash: &[u8; 32],
+    expected_app_id: &AppId,
+    key: &AttestedKey,
+) -> Result<u32> {
+    verify_assertion_cdh(assertion, &[*client_data_hash], expected_app_id, key)
+}
+
+/// Verify an assertion against any one of `client_data_hashes`.
+fn verify_assertion_cdh(
+    assertion: &[u8],
+    client_data_hashes: &[[u8; 32]],
+    expected_app_id: &AppId,
+    key: &AttestedKey,
+) -> Result<u32> {
     use p256::ecdsa::signature::Verifier;
 
     let v: ciborium::value::Value = ciborium::from_reader(assertion)
@@ -570,29 +699,15 @@ pub fn verify_assertion_with_binding(
     //   nonce = SHA256(authenticatorData ‖ clientDataHash)
     // and signs that 32-byte value with the attested P-256 key. ES256 applies
     // its own SHA-256, so the signature is over that value — NOT the raw
-    // `authenticatorData ‖ clientDataHash` concatenation. The only thing the bound form
-    // changes is `clientDataHash`; we reconstruct it per `binding` and verify.
-    // `SHA256(nonce)` and `SHA256(nonce ‖ signing_key)` are disjoint, so an
-    // assertion made for one form never verifies under the other — a bound
-    // assertion fails `NonceOnly`, a legacy assertion fails `RequireBound`, and
-    // a bound assertion paired with a *different* signing key fails too (that is
-    // exactly the replay the binding defeats).
-    let verifies = |client_data_hash: [u8; 32]| -> bool {
+    // `authenticatorData ‖ clientDataHash` concatenation. Only `clientDataHash`
+    // differs between the forms; the caller supplies the candidates.
+    let verifies = |client_data_hash: &[u8; 32]| -> bool {
         let mut to_hash = auth_data.to_vec();
-        to_hash.extend_from_slice(&client_data_hash);
+        to_hash.extend_from_slice(client_data_hash);
         let assertion_nonce: [u8; 32] = Sha256::digest(&to_hash).into();
         vk.verify(&assertion_nonce, &sig).is_ok()
     };
-    let ok = match binding {
-        AssertionBinding::NonceOnly => verifies(assertion_client_data_hash(nonce)),
-        AssertionBinding::RequireBound { signing_key_sec1 } => {
-            verifies(bound_assertion_client_data_hash(nonce, signing_key_sec1))
-        }
-        AssertionBinding::PreferBound { signing_key_sec1 } => {
-            verifies(bound_assertion_client_data_hash(nonce, signing_key_sec1))
-                || verifies(assertion_client_data_hash(nonce))
-        }
-    };
+    let ok = client_data_hashes.iter().any(verifies);
     if !ok {
         return Err(AttestError::AssertionSignatureInvalid);
     }

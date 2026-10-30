@@ -53,7 +53,8 @@ const P384_OID: &str = "1.3.132.0.34";
 /// Keymaster/KeyMint security level of the attested key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityLevel {
-    /// `0` — key lives in software. Rejected: not hardware-backed.
+    /// `0` — key lives in software. Rejected unless
+    /// [`KeyAttestOptions::allow_software`]: not hardware-backed.
     Software,
     /// `1` — Trusted Execution Environment.
     TrustedEnvironment,
@@ -67,8 +68,8 @@ pub struct KeyAttestation {
     /// The leaf device key, SEC1-encoded (the P-256 key the proof's stage chain
     /// and field-2 signature are verified against).
     pub leaf_pubkey_sec1: Vec<u8>,
-    /// The hardware security level the leaf attests to (TEE or StrongBox; a
-    /// Software level is rejected before this is returned).
+    /// The security level the leaf attests to: TEE or StrongBox, or Software
+    /// only when [`KeyAttestOptions::allow_software`] accepted it.
     pub security_level: SecurityLevel,
     /// The attestation schema version from the KeyDescription.
     pub attestation_version: i64,
@@ -83,6 +84,8 @@ pub struct KeyAttestation {
     /// [`AttestMode`]); it is surfaced here for the proof path too, as
     /// information.
     pub root_of_trust: Option<RootOfTrust>,
+    /// The leaf's `attestationChallenge`, as set by the app at key generation.
+    pub attestation_challenge: Vec<u8>,
 }
 
 /// Which verification posture to apply. The proof channel is softer; the
@@ -247,6 +250,60 @@ pub fn verify_key_attestation_multi(
     expected_apps: &[ExpectedAppIdentity],
     mode: AttestMode,
 ) -> Result<KeyAttestation> {
+    let (revoked_serials, require_verified_boot): (&[Vec<u8>], bool) = match mode {
+        AttestMode::Proof => (&[], false),
+        AttestMode::Bootstrap { revoked_serials } => (revoked_serials, true),
+    };
+    verify_key_attestation_with(
+        chain_der,
+        now_unix_secs,
+        &KeyAttestOptions {
+            expected_challenge: Some(expected_challenge),
+            expected_apps,
+            revoked_serials,
+            require_verified_boot,
+            allow_software: false,
+        },
+    )
+}
+
+/// What [`verify_key_attestation_with`] checks beyond the chain itself.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyAttestOptions<'a> {
+    /// The leaf's attestation challenge must equal this. `None` skips the check,
+    /// for a key whose challenge the verifier doesn't know; the leaf's challenge
+    /// is returned in [`KeyAttestation::attestation_challenge`] either way, and
+    /// freshness must then come from elsewhere (for example a one-time challenge
+    /// the device key signs).
+    pub expected_challenge: Option<&'a [u8]>,
+    /// The attested app identity must match one of these in full (see
+    /// [`verify_key_attestation_multi`]). Empty ⇒ not checked.
+    pub expected_apps: &'a [ExpectedAppIdentity],
+    /// Fail if any certificate in the chain has one of these serial numbers (see
+    /// [`AttestMode::Bootstrap`] for the encoding). Empty ⇒ nothing revoked.
+    pub revoked_serials: &'a [Vec<u8>],
+    /// Require `verifiedBootState == Verified` and a locked bootloader. When
+    /// false, both are still returned in [`KeyAttestation::root_of_trust`].
+    pub require_verified_boot: bool,
+    /// Accept a key with the Software security level and return it as
+    /// [`SecurityLevel::Software`]; the caller must not treat such a key as
+    /// hardware-backed. When false it fails with `InsecureSecurityLevel`.
+    pub allow_software: bool,
+}
+
+/// Verify an Android key-attestation chain with explicit [`KeyAttestOptions`].
+/// [`verify_key_attestation`] and [`verify_key_attestation_multi`] are this
+/// function with a fixed challenge, Software refused, and [`AttestMode`] mapped
+/// to `revoked_serials` + `require_verified_boot` (`Proof`: none and false;
+/// `Bootstrap`: the list and true). The chain checks (validity windows, linkage,
+/// a pinned Google root, the extension on the leaf only) are the same in every
+/// case.
+pub fn verify_key_attestation_with(
+    chain_der: &[Vec<u8>],
+    now_unix_secs: u64,
+    opts: &KeyAttestOptions,
+) -> Result<KeyAttestation> {
+    let expected_apps = opts.expected_apps;
     if chain_der.is_empty() {
         return Err(AttestError::MalformedCertChain("empty certificate chain".into()));
     }
@@ -305,8 +362,10 @@ pub fn verify_key_attestation_multi(
     // 4. Leaf: the attestation challenge and security level live in its extension.
     let leaf = &certs[0];
     let kd = parse_key_description(leaf)?;
-    if kd.challenge != expected_challenge {
-        return Err(AttestError::AttestChallengeMismatch);
+    if let Some(expected_challenge) = opts.expected_challenge {
+        if kd.challenge != expected_challenge {
+            return Err(AttestError::AttestChallengeMismatch);
+        }
     }
     // App-identity binding (opt-in). When one or more expected identities are
     // supplied, the attested `attestationApplicationId` must match ONE of them
@@ -324,23 +383,19 @@ pub fn verify_key_attestation_multi(
             _ => return Err(AttestError::AndroidAppIdentityMismatch),
         }
     }
-    let security_level = match kd.security_level {
-        1 => SecurityLevel::TrustedEnvironment,
-        2 => SecurityLevel::StrongBox,
-        _ => return Err(AttestError::InsecureSecurityLevel),
-    };
+    let security_level = security_level_of(kd.security_level, opts.allow_software)?;
 
-    // 5. Bootstrap posture (licence mint): verified boot + locked bootloader +
-    //    revocation. The proof path skips all of this by design.
-    if let AttestMode::Bootstrap { revoked_serials } = mode {
+    // 5. Verified boot + locked bootloader (the bootstrap posture; the proof
+    //    path skips it by design), then revocation.
+    if opts.require_verified_boot {
         enforce_verified_boot(kd.root_of_trust)?;
-        let chain_serials: Vec<&[u8]> = certs
-            .iter()
-            .map(|c| c.tbs_certificate.serial_number.as_bytes())
-            .collect();
-        if is_revoked(&chain_serials, revoked_serials) {
-            return Err(AttestError::AttestationRevoked);
-        }
+    }
+    let chain_serials: Vec<&[u8]> = certs
+        .iter()
+        .map(|c| c.tbs_certificate.serial_number.as_bytes())
+        .collect();
+    if is_revoked(&chain_serials, opts.revoked_serials) {
+        return Err(AttestError::AttestationRevoked);
     }
 
     // 6. The leaf's SEC1 P-256 device key — what proof signatures verify against.
@@ -352,7 +407,19 @@ pub fn verify_key_attestation_multi(
         attestation_version: kd.version,
         app_identity: kd.app_id.as_ref().map(AttestationApplicationId::to_public),
         root_of_trust: kd.root_of_trust,
+        attestation_challenge: kd.challenge,
     })
+}
+
+/// The attested security level: TEE (1) or StrongBox (2), or Software (0) only
+/// when `allow_software`. Anything else fails with `InsecureSecurityLevel`.
+fn security_level_of(raw: u8, allow_software: bool) -> Result<SecurityLevel> {
+    match raw {
+        0 if allow_software => Ok(SecurityLevel::Software),
+        1 => Ok(SecurityLevel::TrustedEnvironment),
+        2 => Ok(SecurityLevel::StrongBox),
+        _ => Err(AttestError::InsecureSecurityLevel),
+    }
 }
 
 /// Bootstrap: require a parsed RootOfTrust in the `Verified` state with a locked
@@ -1360,6 +1427,18 @@ mod tests {
     }
 
     // --- revocation matching (leading-zero-insensitive) ---
+
+    #[test]
+    fn software_level_only_when_allowed() {
+        assert_eq!(security_level_of(0, false), Err(AttestError::InsecureSecurityLevel));
+        assert_eq!(security_level_of(0, true), Ok(SecurityLevel::Software));
+        for allow in [false, true] {
+            assert_eq!(security_level_of(1, allow), Ok(SecurityLevel::TrustedEnvironment));
+            assert_eq!(security_level_of(2, allow), Ok(SecurityLevel::StrongBox));
+            assert_eq!(security_level_of(3, allow), Err(AttestError::InsecureSecurityLevel));
+            assert_eq!(security_level_of(0xff, allow), Err(AttestError::InsecureSecurityLevel));
+        }
+    }
 
     #[test]
     fn revocation_matching() {

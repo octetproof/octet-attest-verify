@@ -4,6 +4,38 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.6.0] - 2026-10-30
+
+Additive: stateless verification for an app-to-web bridge. Existing functions
+behave as before.
+
+### Added
+- **`appattest::verify_attestation_with_client_data_hash`** and
+  **`VerifiedAttestation`**: verify an attestation object over a caller-supplied
+  `clientDataHash`, for a verifier that keeps no state. It also checks the chain's
+  dates at a given time, except the leaf's `notAfter` (the leaf lasts about 3
+  days; the key much longer), and returns the environment and the chain's dates.
+  `attStmt.receipt` is not read, so an object with the receipt removed verifies.
+- **`appattest::verify_assertion_with_client_data_hash`**: verify an assertion
+  over a caller-supplied `clientDataHash`. With the key the attestation returns
+  (counter 0), the counter must be above 0, so nothing needs storing.
+- **`appattest::se_binding_client_data_hash`** (`SE_BINDING_DOMAIN`):
+  `SHA256("octet-se-binding-v1" ‖ se_pub)`, the `clientDataHash` of the assertion
+  that binds a Secure Enclave key to an App Attest key.
+- **`bridge`** module: `bridge_preimage` and `verify_bridge_signature` for the
+  bridge signature (spec §5).
+- **`keyattest::verify_key_attestation_with`** and **`KeyAttestOptions`**: the
+  challenge check is optional; revoked serials are checked without requiring
+  verified boot or a locked bootloader; a Software security level can be
+  accepted on request. `KeyAttestation` gains `attestation_challenge`.
+- Golden vectors under `test-vectors/bridge/`, made independently by
+  `generate.py`, including the real iPhone 11 attestation object with its receipt
+  removed (5,728 → 1,793 bytes).
+
+### Changed
+- Python binding bumped to 0.2.9 for wheel-artefact identity only; its API is
+  unchanged.
+
 ## [2.5.0] - 2026-10-07
 
 Additive: a helper to date an App Attest attestation object's certificate chain.

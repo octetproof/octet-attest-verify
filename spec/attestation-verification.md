@@ -168,6 +168,35 @@ The verifier emits a trusted `DeviceIntegrityVerdict`:
 
 This iteration **reports** the verdict; it does not hard-reject the proof.
 
+### 2.7 Stateless verification (caller-supplied `clientDataHash`)
+
+A verifier that keeps no state checks the attestation object again on every
+request, with the `clientDataHash` it was generated over supplied by the caller
+(`verify_attestation_with_client_data_hash`):
+
+1. Every check of §2.3, with the supplied `clientDataHash` in place of
+   `SHA256(nonce)`. `attStmt.receipt` is not read, so an object with the receipt
+   removed and the map re-encoded verifies the same way.
+2. **Dates** at the verification time `now`: every certificate's `notBefore` is
+   at or before `now`, and the intermediate and the Apple root have not expired.
+   The leaf's `notAfter` is **not** checked: Apple issues the leaf for about 3
+   days, while the attested key stays valid for as long as the app keeps it. The
+   leaf's `notBefore` (about when the key was attested) is returned, so a caller
+   can limit the key's age.
+3. The recovered key carries the attestation's counter, 0. An assertion verified
+   against it must carry a counter above 0, which needs no stored counter.
+
+**Secure Enclave binding assertion.** To bind a Secure Enclave key to an App
+Attest key once, the app makes one assertion over
+
+```
+clientDataHash = SHA256( "octet-se-binding-v1" (ASCII) ‖ se_pub )
+```
+
+where `se_pub` is the Secure Enclave public key as a raw uncompressed P-256
+point (65 bytes, `0x04 ‖ x ‖ y`). It is verified as in §2.4 steps 2–4 with this
+`clientDataHash` (`verify_assertion_with_client_data_hash`).
+
 ---
 
 ## 3. Android device key (Secure-Enclave equivalent)
@@ -211,11 +240,27 @@ hardware-attestation root:
    best-effort so it can never weaken the strict challenge / security-level
    checks above — its enforcement lives entirely in the opt-in comparison.
 
-**Not covered: revocation.** Google publishes a certificate status list
-(`android.googleapis.com/attestation/status`); a fully-offline verifier cannot
-consult it, so a key revoked *after* issuance is not detected here. The deeper
-`RootOfTrust` / verified-boot fields of the authorization lists are likewise not
-yet enforced — `attestationSecurityLevel` already establishes hardware backing.
+**Revocation and verified boot.** Google publishes a certificate status list
+(`android.googleapis.com/attestation/status`). The crate does not fetch it: the
+caller passes the revoked serial numbers it holds, and a chain containing one
+fails. The `RootOfTrust` (verified-boot state and bootloader lock, read from the
+`teeEnforced` list only) is returned, and enforced when the caller requires it.
+
+### 3.2 Options (`verify_key_attestation_with`)
+
+| Option | Effect |
+|---|---|
+| `expected_challenge` | Step 5's challenge check. `None` skips it, for a key whose generation challenge the verifier doesn't know; freshness must then come from elsewhere. The leaf's challenge is returned either way. |
+| `expected_apps` | Step 6, against any one of a set of identities, each matched in full. |
+| `revoked_serials` | Fail if any certificate in the chain has one of these serials (leading zero bytes ignored). |
+| `require_verified_boot` | Require `verifiedBootState == Verified` and a locked bootloader. |
+| `allow_software` | Accept `attestationSecurityLevel == Software` (0) and return it as such. Such a key is not hardware-backed and must not be counted as attested. |
+
+`verify_key_attestation` (and `_multi`) are this function with a fixed
+challenge and Software refused. Their `Proof` mode passes no revoked serials
+and no boot requirement; their `Bootstrap` mode passes both.
+
+---
 
 ---
 
@@ -239,7 +284,30 @@ only** — it cannot independently confirm it.
 
 ---
 
-## 5. Versioning
+## 5. App-to-web bridge signature
+
+When an app that ships the Octet SDK signs a web page's report through a native
+WebView bridge, it signs with the device key: the Secure Enclave key on iOS
+(bound to App Attest by §2.7's binding assertion) or the attested Keystore key on
+Android (the leaf of a §3.1 chain). The signed bytes are
+
+```
+preimage  = "octet-browser-bridge-v1" (ASCII) ‖ SHA256(utf8(s0)) ‖ d (32 bytes) ‖ t (8 bytes, big-endian) ‖ SHA256(k)
+signature = ECDSA-P256-SHA256( device_key, preimage ), DER (X9.62)
+```
+
+- `s0`: the challenge token, as given to the page;
+- `d`: the SHA-256 of the signed bundle;
+- `t`: the signing time, integer milliseconds since the Unix epoch;
+- `k`: the page's public key, a raw uncompressed P-256 point.
+
+As in §2.5, the signer hashes `preimage` itself; a verifier passes the full
+preimage to an ECDSA verify that hashes. A high-S signature is accepted
+(`bridge_preimage`, `verify_bridge_signature`).
+
+---
+
+## 6. Versioning
 
 This spec is versioned with the crate. Any change to a byte layout, OID, hash
 input, or verdict mapping is a wire-contract change and is called out in the
