@@ -4,6 +4,41 @@ All notable changes to `octet-attest-verify` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/).
 
+## [2.7.0] - 2026-11-27
+
+Additive: what a verified Android key-attestation chain says, for a caller
+looking for a leaked keybox. Existing functions behave as before.
+
+### Added
+- **`keyattest::verify_key_attestation_report`**, **`KeyAttestReport`** and
+  **`ChainDetails`**: the result of `verify_key_attestation_with`, plus the
+  chain's read-only details whenever the chain itself verified, refused or not:
+  - `provisioning` (**`Provisioning`**): `RemotelyProvisioned` when the
+    certificate the pinned root issued is Google's RKP CA
+    (`O=Google LLC, CN=Droid CA2`), `Factory` (a keybox) otherwise;
+  - `attestation_cert_serial` and `attestation_cert_issuer`: `chain[1]`, the
+    certificate that signed the leaf, its serial as lowercase hex with no
+    leading zeros (the revocation-list format);
+  - `attestation_security_level`, and `os_version`, `os_patch_level`,
+    `vendor_patch_level` and `boot_patch_level` from `teeEnforced` only;
+  - `root_of_trust` and `leaf_pubkey_sec1`.
+
+  On a verified-boot refusal, `details.root_of_trust` says which state caused
+  it. A chain that fails before the policy checks (validity, linkage, anchor,
+  attestation extension) has no details.
+- Python binding 0.3.0: **`verify_key_attestation_details`** returns the same
+  as `verify_key_attestation` plus these details, as a dict. A refusal raises
+  `AttestationError` with `details` set when the chain itself verified.
+
+### Changed
+- Python binding: an `attestation_unverified_boot` or
+  `attestation_bootloader_unlocked` refusal now ends its `detail` with the state
+  that caused it, e.g. `verified_boot_state=self_signed, device_locked=true`.
+  The slugs are unchanged.
+- **README rewritten** as a starting point: what the crate checks, a quick
+  start, how the layers differ, features and where the docs are. It also states
+  that Octet proves and your backend decides.
+
 ## [2.6.0] - 2026-10-30
 
 Additive: stateless verification for an app-to-web bridge. Existing functions

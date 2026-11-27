@@ -1,10 +1,13 @@
 [package]
 name = "octet-attest-verify"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 description = "Offline verification of mobile device-attestation evidence carried on an Octet LocationProof: Apple App Attest (attestation object + assertion, against Apple's static root), Android hardware key-attestation chain validation (to embedded Google roots), and a Google Play Integrity decode helper. No device-side secret or proof-creation logic."
 repository = "https://github.com/octetproof/octet-attest-verify"
 readme = "README.md"
+# The README banner is served from the repository (crates.io resolves relative
+# image paths there), so the crate does not carry it.
+exclude = ["assets/"]
 license = "Apache-2.0"
 publish = false
 

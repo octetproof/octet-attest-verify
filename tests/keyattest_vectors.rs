@@ -12,7 +12,8 @@
 use std::path::PathBuf;
 
 use octet_attest_verify::keyattest::{
-    verify_key_attestation, verify_key_attestation_with, AttestMode, KeyAttestOptions, SecurityLevel,
+    verify_key_attestation, verify_key_attestation_report, verify_key_attestation_with, AttestMode,
+    KeyAttestOptions, Provisioning, RootOfTrust, SecurityLevel, VerifiedBootState,
 };
 use octet_attest_verify::AttestError;
 
@@ -189,6 +190,95 @@ fn revocation_applies_without_the_boot_requirement() {
             }
         }
     }
+}
+
+/// The read-only chain details, pinned for every genuine chain. The OS and patch
+/// levels were checked against `openssl asn1parse` of each leaf's extension;
+/// the serial and issuer are `chain[1]`'s as `openssl x509` prints them. The
+/// Sony chain is a factory keybox (`serialNumber=` intermediates under the RSA
+/// root); the Pixels are RKP (`Droid CA2` under either root).
+#[test]
+fn chain_details_of_the_genuine_chains() {
+    struct Want {
+        provisioning: Provisioning,
+        serial: &'static str,
+        issuer: &'static str,
+        level: SecurityLevel,
+        os: u32,
+        os_patch: u32,
+        patch: u32, // vendor and boot patch levels (equal on these devices)
+        rot: RootOfTrust,
+    }
+    let verified = RootOfTrust { device_locked: true, verified_boot_state: VerifiedBootState::Verified };
+    let wants = [
+        Want { provisioning: Provisioning::Factory, serial: "16580768335559031605", issuer: "SERIALNUMBER=87f4514475ba0a2b",
+               level: SecurityLevel::TrustedEnvironment, os: 130000, os_patch: 202307, patch: 20230701, rot: verified },
+        Want { provisioning: Provisioning::RemotelyProvisioned, serial: "4f47dffaecc3f58346fb7815514e0dcc", issuer: "CN=Droid CA3,O=Google LLC",
+               level: SecurityLevel::TrustedEnvironment, os: 140000, os_patch: 202408, patch: 20240805,
+               rot: RootOfTrust { device_locked: false, verified_boot_state: VerifiedBootState::Unverified } },
+        Want { provisioning: Provisioning::RemotelyProvisioned, serial: "65d2949536924da695f5ae1eb290cd4d", issuer: "CN=Droid CA3,O=Google LLC",
+               level: SecurityLevel::StrongBox, os: 160000, os_patch: 202511, patch: 20251105, rot: verified },
+        Want { provisioning: Provisioning::RemotelyProvisioned, serial: "2c85cdc15c3042f25698906669c35137", issuer: "CN=Droid CA3,O=Google LLC",
+               level: SecurityLevel::TrustedEnvironment, os: 160000, os_patch: 202602, patch: 20260205, rot: verified },
+    ];
+    for ((sub, files, now), want) in CORPUS.iter().zip(&wants) {
+        let Some(chain) = read_chain(sub, files) else { continue };
+        let opts = no_challenge(&[]);
+        let report = verify_key_attestation_report(&chain, *now, &opts);
+        // The report's result is exactly verify_key_attestation_with's.
+        let plain = verify_key_attestation_with(&chain, *now, &opts);
+        assert_eq!(report.result.as_ref().err(), plain.as_ref().err(), "{sub}");
+        let att = report.result.as_ref().unwrap_or_else(|e| panic!("{sub}: {e}"));
+        let d = report.details.as_ref().unwrap_or_else(|| panic!("{sub}: details"));
+        assert_eq!(d.provisioning, want.provisioning, "{sub}: provisioning");
+        assert_eq!(d.attestation_cert_serial.as_deref(), Some(want.serial), "{sub}: serial");
+        assert_eq!(d.attestation_cert_issuer.as_deref(), Some(want.issuer), "{sub}: issuer");
+        assert_eq!(d.attestation_security_level, Some(want.level), "{sub}: security level");
+        assert_eq!(d.os_version, Some(want.os), "{sub}: osVersion");
+        assert_eq!(d.os_patch_level, Some(want.os_patch), "{sub}: osPatchLevel");
+        assert_eq!(d.vendor_patch_level, Some(want.patch), "{sub}: vendorPatchLevel");
+        assert_eq!(d.boot_patch_level, Some(want.patch), "{sub}: bootPatchLevel");
+        assert_eq!(d.root_of_trust, Some(want.rot), "{sub}: root of trust");
+        assert_eq!(d.root_of_trust, att.root_of_trust, "{sub}: same root of trust as the result");
+        assert_eq!(d.leaf_pubkey_sec1.as_deref(), Some(att.leaf_pubkey_sec1.as_slice()), "{sub}: leaf key");
+    }
+}
+
+/// A refused chain still reports what it says. The akita phone's bootloader is
+/// unlocked (verified boot Unverified), so Bootstrap refuses it; the report
+/// carries the refusal and the root of trust that caused it. Revocation and a
+/// wrong challenge are refusals too, with details. A chain that fails before
+/// the policy checks (here: outside its validity window) has none.
+#[test]
+fn refused_chains_carry_their_details() {
+    let (sub, files, now) = CORPUS[1];
+    let Some(chain) = read_chain(sub, files) else { return };
+    let mut bootstrap = no_challenge(&[]);
+    bootstrap.require_verified_boot = true;
+    let r = verify_key_attestation_report(&chain, now, &bootstrap);
+    assert_eq!(r.result.as_ref().err(), Some(&AttestError::AttestationUnverifiedBoot));
+    let rot = r.details.expect("details on a boot refusal").root_of_trust.expect("root of trust");
+    assert_eq!(rot, RootOfTrust { device_locked: false, verified_boot_state: VerifiedBootState::Unverified });
+
+    let serial = x509_serial(&chain[1]);
+    let r = verify_key_attestation_report(&chain, now, &no_challenge(&[serial]));
+    assert_eq!(r.result.as_ref().err(), Some(&AttestError::AttestationRevoked));
+    assert!(r.details.is_some(), "details on a revocation");
+
+    let mut wrong = no_challenge(&[]);
+    wrong.expected_challenge = Some(b"not-the-challenge");
+    let r = verify_key_attestation_report(&chain, now, &wrong);
+    assert_eq!(r.result.as_ref().err(), Some(&AttestError::AttestChallengeMismatch));
+    assert!(r.details.is_some(), "details on a challenge mismatch");
+
+    let r = verify_key_attestation_report(&chain, 4_000_000_000, &no_challenge(&[]));
+    assert_eq!(r.result.as_ref().err(), Some(&AttestError::CertExpired));
+    assert!(r.details.is_none(), "no details for a chain that did not verify");
+}
+
+fn x509_serial(der: &[u8]) -> Vec<u8> {
+    use x509_cert::der::Decode;
+    x509_cert::Certificate::from_der(der).unwrap().tbs_certificate.serial_number.as_bytes().to_vec()
 }
 
 /// Simple hex decode for the fixed challenge literal above.

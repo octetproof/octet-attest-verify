@@ -134,6 +134,72 @@ pub enum VerifiedBootState {
     Failed,
 }
 
+/// How the attestation key that certified the leaf was provisioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Provisioning {
+    /// Remote key provisioning (RKP): a per-device, short-lived attestation key
+    /// certified by Google's RKP CA. The certificate the pinned root issued in
+    /// the chain is `O=Google LLC, CN=Droid CA2`.
+    RemotelyProvisioned,
+    /// A factory-provisioned attestation key (a "keybox"), installed at
+    /// manufacture and shared across a batch of devices: any other certificate
+    /// directly under the pinned root. Leaked keyboxes are of this kind.
+    Factory,
+}
+
+/// Read-only facts of an Android key-attestation chain, for a caller that wants
+/// more than pass/fail (for example a licence server looking for a leaked
+/// keybox). Returned by [`verify_key_attestation_report`] whenever the chain
+/// itself verified: within its validity windows, signature-linked, anchored to a
+/// pinned Google root, the attestation extension on the leaf only and parseable.
+/// It is returned with a refusal too (verified boot, revocation, challenge, app
+/// identity, security level), so the caller can see what the refused chain
+/// says. Nothing here is checked against a policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChainDetails {
+    /// RKP or factory keybox, from the certificate the pinned root issued.
+    pub provisioning: Provisioning,
+    /// The serial of the attestation certificate (`chain[1]`, the one that
+    /// signed the leaf) as lowercase hex with no leading zeros, the format of
+    /// Google's revocation list. `None` for a chain with no certificate above
+    /// the leaf.
+    pub attestation_cert_serial: Option<String>,
+    /// The issuer of the attestation certificate (`chain[1]`), as an RFC 4514
+    /// string. Serials are unique per issuer.
+    pub attestation_cert_issuer: Option<String>,
+    /// `attestationSecurityLevel` from the KeyDescription, Software included;
+    /// `None` for a value outside 0–2.
+    pub attestation_security_level: Option<SecurityLevel>,
+    /// `osVersion [705]` from `teeEnforced`, e.g. `160000` for Android 16.
+    pub os_version: Option<u32>,
+    /// `osPatchLevel [706]` from `teeEnforced`, `YYYYMM`.
+    pub os_patch_level: Option<u32>,
+    /// `vendorPatchLevel [718]` from `teeEnforced`, `YYYYMMDD`.
+    pub vendor_patch_level: Option<u32>,
+    /// `bootPatchLevel [719]` from `teeEnforced`, `YYYYMMDD` (some devices
+    /// report `YYYYMM`).
+    pub boot_patch_level: Option<u32>,
+    /// The RootOfTrust from `teeEnforced`, as in [`KeyAttestation::root_of_trust`].
+    pub root_of_trust: Option<RootOfTrust>,
+    /// The leaf device key, SEC1-encoded, when it is a valid P-256 key.
+    pub leaf_pubkey_sec1: Option<Vec<u8>>,
+}
+
+/// The outcome of [`verify_key_attestation_report`]: the same result as
+/// [`verify_key_attestation_with`], plus the chain's [`ChainDetails`] whenever
+/// the chain itself verified, refused or not.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct KeyAttestReport {
+    /// Exactly what [`verify_key_attestation_with`] returns for the same input.
+    pub result: Result<KeyAttestation>,
+    /// `Some` iff the chain verified up to the policy checks (see
+    /// [`ChainDetails`]); `None` when it failed before them.
+    pub details: Option<ChainDetails>,
+}
+
 /// The attested Android app identity, in the shape the backend compares against a
 /// registered `(package_name, signing_cert_sha256)` pair: registered pair matches
 /// iff `package_name ∈ package_names` **and** `signing_cert_sha256 ∈
@@ -303,6 +369,29 @@ pub fn verify_key_attestation_with(
     now_unix_secs: u64,
     opts: &KeyAttestOptions,
 ) -> Result<KeyAttestation> {
+    verify_key_attestation_report(chain_der, now_unix_secs, opts).result
+}
+
+/// [`verify_key_attestation_with`], also returning the chain's [`ChainDetails`]
+/// whenever the chain itself verified, so a caller can read what a refused
+/// chain says (for example which verified-boot state a Bootstrap refusal saw).
+/// The result is exactly that of [`verify_key_attestation_with`].
+pub fn verify_key_attestation_report(
+    chain_der: &[Vec<u8>],
+    now_unix_secs: u64,
+    opts: &KeyAttestOptions,
+) -> KeyAttestReport {
+    let mut details = None;
+    let result = verify_chain(chain_der, now_unix_secs, opts, &mut details);
+    KeyAttestReport { result, details }
+}
+
+fn verify_chain(
+    chain_der: &[Vec<u8>],
+    now_unix_secs: u64,
+    opts: &KeyAttestOptions,
+    details: &mut Option<ChainDetails>,
+) -> Result<KeyAttestation> {
     let expected_apps = opts.expected_apps;
     if chain_der.is_empty() {
         return Err(AttestError::MalformedCertChain("empty certificate chain".into()));
@@ -357,11 +446,14 @@ pub fn verify_key_attestation_with(
 
     // 3. Anchor: the top of the supplied chain must be, or be signed by, a pinned
     //    Google root.
-    anchor_to_google_root(certs.last().expect("non-empty"))?;
+    let top_is_root = anchor_to_google_root(certs.last().expect("non-empty"))?;
 
     // 4. Leaf: the attestation challenge and security level live in its extension.
     let leaf = &certs[0];
     let kd = parse_key_description(leaf)?;
+
+    // The chain itself is verified: record what it says before any policy check.
+    *details = Some(chain_details(&certs, top_is_root, &kd));
     if let Some(expected_challenge) = opts.expected_challenge {
         if kd.challenge != expected_challenge {
             return Err(AttestError::AttestChallengeMismatch);
@@ -478,7 +570,9 @@ fn has_key_attestation_extension(cert: &Certificate) -> bool {
         .is_some_and(|exts| exts.iter().any(|e| e.extn_id.to_string() == KEY_ATTESTATION_OID))
 }
 
-fn anchor_to_google_root(top: &Certificate) -> Result<()> {
+/// Returns whether `top` is itself the pinned root (`true`) or is signed by one
+/// (`false`).
+fn anchor_to_google_root(top: &Certificate) -> Result<bool> {
     let top_der = top
         .to_der()
         .map_err(|e| AttestError::MalformedCertChain(format!("top cert der: {e}")))?;
@@ -487,17 +581,67 @@ fn anchor_to_google_root(top: &Certificate) -> Result<()> {
 
     // Case 1: the chain already ends at a pinned root.
     if roots.iter().any(|(_, fp)| *fp == top_fp) {
-        return Ok(());
+        return Ok(true);
     }
     // Case 2: the top intermediate is signed by a pinned root.
     for (root, _) in &roots {
         if root.tbs_certificate.subject == top.tbs_certificate.issuer
             && verify_signed_by(top, root).is_ok()
         {
-            return Ok(());
+            return Ok(false);
         }
     }
     Err(AttestError::KeyAttestNotAnchored)
+}
+
+/// The [`ChainDetails`] of a chain that has verified up to the policy checks.
+fn chain_details(certs: &[Certificate], top_is_root: bool, kd: &KeyDescription) -> ChainDetails {
+    // The certificate the pinned root issued: the top one, or the one below a
+    // root that the chain includes.
+    let under_root = if top_is_root { certs.len().checked_sub(2) } else { Some(certs.len() - 1) };
+    let provisioning = match under_root.map(|i| &certs[i]) {
+        Some(c) if is_rkp_ca(c) => Provisioning::RemotelyProvisioned,
+        _ => Provisioning::Factory,
+    };
+    let attestation_cert = certs.get(1);
+    ChainDetails {
+        provisioning,
+        attestation_cert_serial: attestation_cert
+            .map(|c| serial_hex(c.tbs_certificate.serial_number.as_bytes())),
+        attestation_cert_issuer: attestation_cert.map(|c| c.tbs_certificate.issuer.to_string()),
+        attestation_security_level: security_level_of(kd.security_level, true).ok(),
+        os_version: kd.os_version,
+        os_patch_level: kd.os_patch_level,
+        vendor_patch_level: kd.vendor_patch_level,
+        boot_patch_level: kd.boot_patch_level,
+        root_of_trust: kd.root_of_trust,
+        leaf_pubkey_sec1: leaf_sec1_p256(&certs[0]).ok(),
+    }
+}
+
+/// Whether `cert` is Google's RKP CA: subject exactly `O=Google LLC, CN=Droid CA2`
+/// (in any order). Only called on a certificate a pinned root signed, so the
+/// subject is Google's own.
+fn is_rkp_ca(cert: &Certificate) -> bool {
+    let mut attrs: Vec<String> = cert
+        .tbs_certificate
+        .subject
+        .0
+        .iter()
+        .flat_map(|rdn| rdn.0.iter().map(|atv| atv.to_string()))
+        .collect();
+    attrs.sort();
+    attrs == ["CN=Droid CA2", "O=Google LLC"]
+}
+
+/// A certificate serial as lowercase hex with no leading zeros (`"0"` for zero),
+/// the format of Google's attestation revocation list.
+fn serial_hex(bytes: &[u8]) -> String {
+    let hex: String = strip_leading_zeros(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    match hex.trim_start_matches('0') {
+        "" => "0".into(),
+        s => s.into(),
+    }
 }
 
 /// Verify `subject`'s signature was produced by `issuer`'s public key. Dispatches
@@ -633,6 +777,13 @@ struct KeyDescription {
     /// `None` when absent — the bootstrap path treats `None` as unverified boot
     /// (fail closed).
     root_of_trust: Option<RootOfTrust>,
+    /// `osVersion [705]`, `osPatchLevel [706]`, `vendorPatchLevel [718]` and
+    /// `bootPatchLevel [719]` from `teeEnforced` only, each when present and a
+    /// non-negative INTEGER that fits a `u32`. Informational, never enforced.
+    os_version: Option<u32>,
+    os_patch_level: Option<u32>,
+    vendor_patch_level: Option<u32>,
+    boot_patch_level: Option<u32>,
 }
 
 /// The Android `attestationApplicationId`: which app(s) and signing cert(s) the
@@ -762,12 +913,48 @@ fn parse_key_description_der(der: &[u8]) -> Result<KeyDescription> {
     // challenge/security-level path above — a required-but-unparseable app id is
     // handled as a mismatch by the caller, not as a parse error here.
     let app_id = extract_app_id(rest);
-    let root_of_trust = extract_root_of_trust(rest);
-    Ok(KeyDescription { version, security_level, challenge: v.to_vec(), app_id, root_of_trust })
+    let tee = tee_enforced(rest);
+    let tee_u32 = |tag: &[u8]| tee.and_then(|t| find_u32(t, tag));
+    Ok(KeyDescription {
+        version,
+        security_level,
+        challenge: v.to_vec(),
+        app_id,
+        root_of_trust: tee.and_then(find_root_of_trust),
+        os_version: tee_u32(OS_VERSION_TAG),
+        os_patch_level: tee_u32(OS_PATCH_LEVEL_TAG),
+        vendor_patch_level: tee_u32(VENDOR_PATCH_LEVEL_TAG),
+        boot_patch_level: tee_u32(BOOT_PATCH_LEVEL_TAG),
+    })
 }
 
-/// Best-effort walk from just-after-`attestationChallenge` to the `rootOfTrust`
-/// (`[704]`) in `teeEnforced` **only**. `softwareEnforced` is walked past but its
+// AuthorizationList context tags (EXPLICIT INTEGER), as identifier octets.
+const OS_VERSION_TAG: &[u8] = &[0xBF, 0x85, 0x41]; // [705]
+const OS_PATCH_LEVEL_TAG: &[u8] = &[0xBF, 0x85, 0x42]; // [706]
+const VENDOR_PATCH_LEVEL_TAG: &[u8] = &[0xBF, 0x85, 0x4E]; // [718]
+const BOOT_PATCH_LEVEL_TAG: &[u8] = &[0xBF, 0x85, 0x4F]; // [719]
+
+/// Scan an AuthorizationList for an EXPLICIT INTEGER field and return it when
+/// it is a non-negative INTEGER that fits a `u32`; `None` otherwise.
+fn find_u32(authlist: &[u8], want: &[u8]) -> Option<u32> {
+    let mut cursor = authlist;
+    while !cursor.is_empty() {
+        let (tag, value, next) = der_tlv_hightag(cursor)?;
+        if tag == want {
+            let (t, int, _) = der_tlv(value)?;
+            if t != 0x02 || int.is_empty() || int.len() > 5 || int[0] & 0x80 != 0 {
+                return None;
+            }
+            return u32::try_from(be_int(int)).ok();
+        }
+        cursor = next;
+    }
+    None
+}
+
+/// Best-effort walk from just-after-`attestationChallenge` to the `teeEnforced`
+/// AuthorizationList, the only list `rootOfTrust` (`[704]`) and the OS and patch
+/// levels are read from. `softwareEnforced` is walked past but its
 /// rootOfTrust is never read: it is framework-populated, not TA-vouched, so
 /// trusting it inverts the anti-root check. A rootOfTrust found solely in
 /// `softwareEnforced` is thus reported as absent. `None` on any deviation — the
@@ -782,7 +969,7 @@ fn parse_key_description_der(der: &[u8]) -> Result<KeyDescription> {
 ///     verifiedBootHash   OCTET STRING OPTIONAL,
 /// }
 /// ```
-fn extract_root_of_trust(after_challenge: &[u8]) -> Option<RootOfTrust> {
+fn tee_enforced(after_challenge: &[u8]) -> Option<&[u8]> {
     // uniqueId OCTET STRING.
     let (t, _unique, rest) = der_tlv(after_challenge)?;
     if t != 0x04 {
@@ -808,7 +995,7 @@ fn extract_root_of_trust(after_challenge: &[u8]) -> Option<RootOfTrust> {
     if t != 0x30 {
         return None;
     }
-    find_root_of_trust(tee_enforced)
+    Some(tee_enforced)
 }
 
 /// Scan an AuthorizationList for `rootOfTrust [704]` (identifier octets
@@ -1271,6 +1458,74 @@ mod tests {
             signature_digests: vec![vec![0x11; 32], vec![0x22; 20]],
         };
         assert_eq!(app.to_public().cert_sha256_digests, vec![[0x11u8; 32]]);
+    }
+
+    // --- ChainDetails: serial format and the teeEnforced OS / patch levels ---
+
+    #[test]
+    fn serial_hex_is_lowercase_without_leading_zeros() {
+        assert_eq!(serial_hex(&[0x00, 0x4F, 0x47]), "4f47");
+        assert_eq!(serial_hex(&[0x03, 0x88]), "388"); // a leading zero nibble too
+        assert_eq!(serial_hex(&[0x00, 0x00]), "0");
+        assert_eq!(serial_hex(&[]), "0");
+    }
+
+    /// A KeyDescription with `sw` and `tee` as the two AuthorizationList bodies.
+    fn key_description_der_with_lists(sw: &[u8], tee: &[u8]) -> Vec<u8> {
+        let body = [
+            der(&[0x02], &[4]),
+            der(&[0x0a], &[1]),
+            der(&[0x02], &[0x01, 0x2c]),
+            der(&[0x0a], &[1]),
+            der(&[0x04], b"chal"),
+            der(&[0x04], &[]),
+            der(&[0x30], sw),
+            der(&[0x30], tee),
+        ]
+        .concat();
+        der(&[0x30], &body)
+    }
+
+    fn tagged_int(tag: &[u8], int: &[u8]) -> Vec<u8> {
+        der(tag, &der(&[0x02], int))
+    }
+
+    #[test]
+    fn os_and_patch_levels_come_from_tee_enforced_only() {
+        let tee = [
+            tagged_int(OS_VERSION_TAG, &[0x02, 0x71, 0x00]),             // 160000
+            tagged_int(OS_PATCH_LEVEL_TAG, &[0x03, 0x17, 0x0F]),         // 202511
+            tagged_int(VENDOR_PATCH_LEVEL_TAG, &[0x01, 0x35, 0x01, 0xE1]), // 20251105
+            tagged_int(BOOT_PATCH_LEVEL_TAG, &[0x00, 0x03, 0x17, 0x0F]), // 202511, sign-padded
+        ]
+        .concat();
+        let kd = parse_key_description_der(&key_description_der_with_lists(&[], &tee)).unwrap();
+        assert_eq!(kd.os_version, Some(160000));
+        assert_eq!(kd.os_patch_level, Some(202511));
+        assert_eq!(kd.vendor_patch_level, Some(20251105));
+        assert_eq!(kd.boot_patch_level, Some(202511));
+
+        // The same fields in softwareEnforced only are not read.
+        let kd = parse_key_description_der(&key_description_der_with_lists(&tee, &[])).unwrap();
+        assert_eq!((kd.os_version, kd.os_patch_level, kd.vendor_patch_level, kd.boot_patch_level),
+                   (None, None, None, None));
+    }
+
+    #[test]
+    fn malformed_patch_levels_are_none() {
+        for bad in [
+            der(OS_VERSION_TAG, &der(&[0x02], &[0x80])),              // negative
+            der(OS_VERSION_TAG, &der(&[0x02], &[])),                  // empty INTEGER
+            der(OS_VERSION_TAG, &der(&[0x02], &[1, 0, 0, 0, 0])),     // > u32::MAX
+            der(OS_VERSION_TAG, &der(&[0x04], &[1])),                 // not an INTEGER
+        ] {
+            let kd = parse_key_description_der(&key_description_der_with_lists(&[], &bad)).unwrap();
+            assert_eq!(kd.os_version, None, "{bad:02x?}");
+        }
+        // u32::MAX itself, sign-padded, is accepted.
+        let max = tagged_int(OS_VERSION_TAG, &[0x00, 0xff, 0xff, 0xff, 0xff]);
+        let kd = parse_key_description_der(&key_description_der_with_lists(&[], &max)).unwrap();
+        assert_eq!(kd.os_version, Some(u32::MAX));
     }
 
     // --- RootOfTrust parsing + the bootstrap verified-boot gate ---
